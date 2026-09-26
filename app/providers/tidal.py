@@ -18,11 +18,13 @@ TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 API_BASE = "https://api.tidal.com/v1"
 
 class TidalProvider(MusicProvider):
-    def __init__(self, token_file: str = "token.json", country_code: str = "US"):
+    def __init__(self, token_file: str = "token.json", country_code: str = "US", public_host: str = ""):
         self.token_file = Path(token_file)
         self.country_code = country_code or "US"
+        self.public_host = public_host.rstrip("/") if public_host else ""
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
+        self.dash_cache: dict[str, str] = {}
         self._load_token()
 
     @property
@@ -232,11 +234,17 @@ class TidalProvider(MusicProvider):
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
 
-            # Tidal DASH manifest payload
+            # Tidal DASH manifest payload: serve via proper HTTP endpoint instead of unplayable data URI
             if "dash" in mime and raw_manifest:
-                manifest_data_uri = f"data:application/dash+xml;base64,{raw_manifest}"
+                try:
+                    decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
+                    self.dash_cache[clean_id] = decoded_xml
+                except Exception as e:
+                    logger.error(f"Failed to decode DASH XML: {e}")
+
+                manifest_url = f"{self.public_host}/dash/td/{clean_id}.mpd" if self.public_host else f"/dash/td/{clean_id}.mpd"
                 return {
-                    "url": manifest_data_uri,
+                    "url": manifest_url,
                     "format": "dash",
                     "codec": "flac",
                     "container": "dash",

@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger("bitchord.unified")
 
 deezer = DeezerProvider(settings.deezer_arl, settings.public_host)
-tidal = TidalProvider(settings.tidal_token_file, settings.tidal_country_code)
+tidal = TidalProvider(settings.tidal_token_file, settings.tidal_country_code, settings.public_host)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,7 +53,7 @@ async def security_token_middleware(request: Request, call_next):
     path = request.url.path
 
     # Public diagnostic routes
-    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/"):
+    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/"):
         return await call_next(request)
 
     # If no ACCESS_TOKEN is set in .env, run in open mode
@@ -199,6 +199,20 @@ async def resolve_stream(item_id: str, quality: str = "lossless"):
         status_code=404,
         content={"error": f"Track {item_id} could not be resolved by configured providers."}
     )
+
+@app.get("/dash/td/{track_id}")
+async def serve_dash_manifest(track_id: str):
+    """Serve decoded DASH MPD XML manifest for BitChord / ExoPlayer."""
+    clean_id = track_id.replace("td:", "").replace(".mpd", "")
+    manifest_xml = tidal.dash_cache.get(clean_id)
+    if not manifest_xml:
+        await tidal.get_stream(clean_id)
+        manifest_xml = tidal.dash_cache.get(clean_id)
+
+    if not manifest_xml:
+        raise HTTPException(status_code=404, detail="DASH manifest not found")
+
+    return Response(content=manifest_xml, media_type="application/dash+xml")
 
 @app.get("/audio/dz/{track_id}")
 async def stream_deezer_flac(track_id: str, request: Request):
