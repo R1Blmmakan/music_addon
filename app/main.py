@@ -435,6 +435,8 @@ async def stream_deezer_flac(track_id: str, request: Request):
     try:
         audio_gen, headers, status = await deezer.stream_decrypted_audio(clean_id, range_header)
         return StreamingResponse(audio_gen, status_code=status, headers=headers)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"Error streaming track {clean_id}: {exc}")
         raise HTTPException(status_code=502, detail="Failed to retrieve audio stream from Deezer")
