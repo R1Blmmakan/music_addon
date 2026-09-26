@@ -206,6 +206,15 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
+@app.get("/diag/proxy")
+async def diag_proxy(path: str, country: str = ""):
+    """Proxy authenticated diagnostic query to Tidal API."""
+    cc = country or tidal.country_code
+    url = f"https://api.tidal.com/v1/{path.lstrip('/')}"
+    params = {"countryCode": cc}
+    resp = await tidal.client.get(url, headers=tidal._auth_headers(), params=params)
+    return Response(content=resp.text, media_type="application/json")
+
 @app.get("/diag/td/{track_id}")
 async def diag_tidal(track_id: str, country: str = ""):
     """Diagnostic endpoint to inspect raw Tidal manifest data."""
