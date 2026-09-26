@@ -211,6 +211,15 @@ class TidalProvider(MusicProvider):
                     if has_title_match and has_artist_match:
                         score -= 400
 
+                # Studio release priority over soundtrack/compilation
+                t_album = item.get("album", {}).get("title", "").strip().lower()
+                tags = item.get("mediaMetadata", {}).get("tags", [])
+                is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
+                if is_hi_res:
+                    score -= 150
+                if "soundtrack" in t_album or "compilation" in t_album:
+                    score += 150
+
                 # Factor in popularity
                 score -= popularity * 2
 
@@ -226,10 +235,6 @@ class TidalProvider(MusicProvider):
                 is_atmos = "DOLBY_ATMOS" in tags or "DOLBY_ATMOS" in item.get("audioModes", [])
                 is_lossless = is_hi_res or "LOSSLESS" in tags or item.get("audioQuality") == "LOSSLESS"
 
-                # FLAC-ONLY POLICY: Omit lossy-only tracks from the host catalog
-                if not is_lossless:
-                    continue
-
                 cover_hash = item.get("album", {}).get("cover")
                 artwork = None
                 if cover_hash:
@@ -244,8 +249,8 @@ class TidalProvider(MusicProvider):
                     "artwork": artwork,
                     "artworkURL": artwork,
                     "format": "flac",
-                    "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else "LOSSLESS",
-                    "bitrate": 9216 if is_hi_res else 1411,
+                    "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else ("LOSSLESS" if is_lossless else "HIGH"),
+                    "bitrate": 9216 if is_hi_res else (1411 if is_lossless else 320),
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                 })
@@ -285,25 +290,63 @@ class TidalProvider(MusicProvider):
         return None
 
     async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
-        """Resolve track ID into signed FLAC CDN URL or DASH manifest without track swapping."""
+        """Resolve track ID into signed FLAC CDN URL or DASH manifest with strict studio master upgrade."""
         if not self.is_configured():
             return None
 
         clean_id = track_id.replace("td:", "")
-        # FLAC ONLY: Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
-        # Never query lossy HIGH or LOW tiers
-        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS"]
+        original_id = clean_id
+        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
 
         data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
-            logger.info(f"Tidal playbackinfo returned no lossless stream for track {clean_id}")
+            logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
             return None
 
-        # FLAC ONLY validation: Reject if Tidal downgraded response to lossy AAC (HIGH/LOW)
-        actual_quality = data.get("audioQuality", "")
-        if actual_quality in ("HIGH", "LOW"):
-            logger.info(f"Tidal track {clean_id} only offers lossy AAC ({actual_quality}); rejecting under FLAC-ONLY policy.")
-            return None
+        # Studio Master Upgrade for Soundtracks/Compilations:
+        # If Tidal only provides 320k AAC (HIGH) for this specific rendition (e.g. movie soundtracks),
+        # look for the official studio album master with Hi-Res/Lossless by the EXACT same artist.
+        if data.get("audioQuality") == "HIGH":
+            try:
+                meta_url = f"{API_BASE}/tracks/{clean_id}"
+                meta_resp = await self.client.get(meta_url, headers=self._auth_headers(), params={"countryCode": self.country_code})
+                if meta_resp.status_code == 200:
+                    meta = meta_resp.json()
+                    track_title = meta.get("title", "").strip()
+                    artist_name = meta.get("artist", {}).get("name", "").strip()
+                    orig_duration = float(meta.get("duration", 0))
+
+                    if track_title and artist_name:
+                        lookup_query = f"{track_title} {artist_name}".strip()
+                        candidates = await self.search(lookup_query, limit=10)
+                        for cand in candidates:
+                            cand_id = cand["id"].replace("td:", "")
+                            cand_title = cand.get("title", "").strip().lower()
+                            cand_artist = cand.get("artist", "").strip().lower()
+                            cand_duration = float(cand.get("duration", 0))
+
+                            # 1. Exact artist match (strictly NO cover singers)
+                            if cand_artist != artist_name.lower():
+                                continue
+                            # 2. Exact title match
+                            if cand_title != track_title.lower():
+                                continue
+                            # 3. Reject covers, remixes, instrumentals, speed up
+                            if any(bad in cand_title for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic")):
+                                continue
+                            # 4. Strict duration matching within 2.5 seconds
+                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 2.5:
+                                continue
+
+                            if cand_id != clean_id:
+                                cand_data = await self._fetch_playback_info(cand_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
+                                if cand_data and cand_data.get("audioQuality") in ("HI_RES_LOSSLESS", "LOSSLESS"):
+                                    logger.info(f"Resolved track {clean_id} (HIGH) to studio master {cand_id} ({cand_data.get('audioQuality')}) by {artist_name}")
+                                    clean_id = cand_id
+                                    data = cand_data
+                                    break
+            except Exception as upgrade_err:
+                logger.warning(f"Studio master lookup failed for track {clean_id}: {upgrade_err}")
 
         try:
             raw_manifest = data.get("manifest")
@@ -321,21 +364,17 @@ class TidalProvider(MusicProvider):
                     if direct_urls:
                         url = direct_urls[0]
                         is_actual_flac = raw_depth is not None and raw_depth >= 16 and "mp4a" not in decoded.get("codecs", "")
-                        if not is_actual_flac:
-                            logger.info(f"Tidal BTS track {clean_id} is lossy AAC ({decoded.get('codecs')}); rejecting under FLAC-ONLY policy.")
-                            return None
-
                         is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
                         return {
                             "url": url,
                             "format": "flac",
-                            "codec": "flac",
+                            "codec": "flac" if is_actual_flac else "aac",
                             "container": "mp4" if is_mp4 else "flac",
                             "manifest": "none",
                             "encrypted": False,
                             "bitDepth": raw_depth or 16,
                             "sampleRate": raw_rate or 44100,
-                            "bitrate": 1411,
+                            "bitrate": 1411 if is_actual_flac else 320,
                         }
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
@@ -345,6 +384,8 @@ class TidalProvider(MusicProvider):
                 try:
                     decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
                     self.dash_cache[clean_id] = decoded_xml
+                    if original_id != clean_id:
+                        self.dash_cache[original_id] = decoded_xml
                 except Exception as e:
                     logger.error(f"Failed to decode DASH XML: {e}")
                     return None
@@ -355,11 +396,10 @@ class TidalProvider(MusicProvider):
                 if bw_match:
                     calc_bitrate = max(int(bw_match.group(1)) // 1000, 1411)
                 else:
-                    # Dynamically calculate from PCM sample rate and bit depth
                     calc_bitrate = int((sample_rate or 44100) * (bit_depth or 16) * 2 // 1000)
 
                 effective_host = (public_host or self.public_host).rstrip("/")
-                manifest_url = f"{effective_host}/dash/td/{clean_id}.mpd" if effective_host else f"/dash/td/{clean_id}.mpd"
+                manifest_url = f"{effective_host}/dash/td/{original_id}.mpd" if effective_host else f"/dash/td/{original_id}.mpd"
                 return {
                     "url": manifest_url,
                     "format": "flac",
