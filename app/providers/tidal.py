@@ -175,25 +175,39 @@ class TidalProvider(MusicProvider):
         clean_id = track_id.replace("td:", "")
         wanted_quality = "HI_RES_LOSSLESS" if quality.lower() in ("lossless", "max", "hi-res") else "LOSSLESS"
 
-        url = f"{API_BASE}/tracks/{clean_id}/playbackinfopostpaywall"
-        params = {
-            "countryCode": self.country_code,
-            "audioquality": wanted_quality,
-            "playbackmode": "STREAM",
-            "assetpresentation": "FULL",
-        }
+        qualities_to_try = [wanted_quality]
+        if wanted_quality != "LOSSLESS":
+            qualities_to_try.append("LOSSLESS")
+
+        data = None
+        for q in qualities_to_try:
+            for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
+                url = f"{API_BASE}/tracks/{clean_id}/{endpoint}"
+                params = {
+                    "countryCode": self.country_code,
+                    "audioquality": q,
+                    "playbackmode": "STREAM",
+                    "assetpresentation": "FULL",
+                }
+                try:
+                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                    if resp.status_code == 401:
+                        if await self._refresh_access_token():
+                            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        break
+                except Exception:
+                    pass
+            if data:
+                break
+
+        if not data:
+            logger.error(f"Tidal playbackinfo failed for track {clean_id} across all quality tiers")
+            return None
 
         try:
-            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-            if resp.status_code == 401:
-                if await self._refresh_access_token():
-                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-
-            if resp.status_code != 200:
-                logger.error(f"Tidal playbackinfo failed for track {clean_id}: {resp.status_code} {resp.text[:200]}")
-                return None
-
-            data = resp.json()
             raw_manifest = data.get("manifest")
             mime = data.get("manifestMimeType", "")
             bit_depth = data.get("bitDepth", 16)
