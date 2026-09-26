@@ -18,9 +18,10 @@ TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 API_BASE = "https://api.tidal.com/v1"
 
 class TidalProvider(MusicProvider):
-    def __init__(self, token_file: str = "token.json", country_code: str = "US", public_host: str = ""):
+    def __init__(self, token_file: str = "token.json", country_code: str = "ID", public_host: str = ""):
         self.token_file = Path(token_file)
-        self.country_code = country_code or "US"
+        self.configured_country_code = country_code or "ID"
+        self.country_code = self.configured_country_code
         self.public_host = public_host.rstrip("/") if public_host else ""
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
@@ -109,7 +110,8 @@ class TidalProvider(MusicProvider):
                     resp = await self.client.get(url, headers=self._auth_headers())
             if resp.status_code == 200:
                 cc = resp.json().get("countryCode")
-                if cc:
+                logger.info(f"Tidal session verified (session geoIP: {cc}, active countryCode: {self.country_code})")
+                if not self.country_code and cc:
                     self.country_code = cc
                 return True
             return False
@@ -218,10 +220,15 @@ class TidalProvider(MusicProvider):
             sorted_items = [x[2] for x in scored_items]
 
             tracks = []
-            for item in sorted_items[:limit]:
+            for item in sorted_items:
                 tags = item.get("mediaMetadata", {}).get("tags", [])
                 is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
                 is_atmos = "DOLBY_ATMOS" in tags or "DOLBY_ATMOS" in item.get("audioModes", [])
+                is_lossless = is_hi_res or "LOSSLESS" in tags or item.get("audioQuality") == "LOSSLESS"
+
+                # FLAC-ONLY POLICY: Omit lossy-only tracks from the host catalog
+                if not is_lossless:
+                    continue
 
                 cover_hash = item.get("album", {}).get("cover")
                 artwork = None
@@ -238,10 +245,12 @@ class TidalProvider(MusicProvider):
                     "artworkURL": artwork,
                     "format": "flac",
                     "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else "LOSSLESS",
-                    "bitrate": 3000 if is_hi_res else 1411,
+                    "bitrate": 9216 if is_hi_res else 1411,
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                 })
+                if len(tracks) >= limit:
+                    break
             return tracks
         except Exception as exc:
             logger.error(f"Tidal search failed for '{query}': {exc}")
@@ -276,12 +285,19 @@ class TidalProvider(MusicProvider):
             return None
 
         clean_id = track_id.replace("td:", "")
-        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC) and High (320k)
-        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
+        # FLAC ONLY: Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
+        # Never query lossy HIGH or LOW tiers
+        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS"]
 
         data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
-            logger.error(f"Tidal playbackinfo failed for track {clean_id} across all quality tiers")
+            logger.info(f"Tidal playbackinfo returned no lossless stream for track {clean_id}")
+            return None
+
+        # FLAC ONLY validation: Reject if Tidal downgraded response to lossy AAC (HIGH/LOW)
+        actual_quality = data.get("audioQuality", "")
+        if actual_quality in ("HIGH", "LOW"):
+            logger.info(f"Tidal track {clean_id} only offers lossy AAC ({actual_quality}); rejecting under FLAC-ONLY policy.")
             return None
 
         try:
@@ -299,18 +315,22 @@ class TidalProvider(MusicProvider):
                     direct_urls = decoded.get("urls", [])
                     if direct_urls:
                         url = direct_urls[0]
-                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
                         is_actual_flac = raw_depth is not None and raw_depth >= 16 and "mp4a" not in decoded.get("codecs", "")
+                        if not is_actual_flac:
+                            logger.info(f"Tidal BTS track {clean_id} is lossy AAC ({decoded.get('codecs')}); rejecting under FLAC-ONLY policy.")
+                            return None
+
+                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
                         return {
                             "url": url,
                             "format": "flac",
-                            "codec": "flac" if is_actual_flac else "aac",
+                            "codec": "flac",
                             "container": "mp4" if is_mp4 else "flac",
                             "manifest": "none",
                             "encrypted": False,
                             "bitDepth": raw_depth or 16,
                             "sampleRate": raw_rate or 44100,
-                            "bitrate": 1411 if is_actual_flac else 320,
+                            "bitrate": 1411,
                         }
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
@@ -322,6 +342,16 @@ class TidalProvider(MusicProvider):
                     self.dash_cache[clean_id] = decoded_xml
                 except Exception as e:
                     logger.error(f"Failed to decode DASH XML: {e}")
+                    return None
+
+                # Extract exact bandwidth from MPD XML Representation tag (e.g. bandwidth="5057582")
+                import re
+                bw_match = re.search(r'bandwidth="(\d+)"', decoded_xml)
+                if bw_match:
+                    calc_bitrate = max(int(bw_match.group(1)) // 1000, 1411)
+                else:
+                    # Dynamically calculate from PCM sample rate and bit depth
+                    calc_bitrate = int((sample_rate or 44100) * (bit_depth or 16) * 2 // 1000)
 
                 effective_host = (public_host or self.public_host).rstrip("/")
                 manifest_url = f"{effective_host}/dash/td/{clean_id}.mpd" if effective_host else f"/dash/td/{clean_id}.mpd"
@@ -334,7 +364,7 @@ class TidalProvider(MusicProvider):
                     "encrypted": False,
                     "bitDepth": bit_depth,
                     "sampleRate": sample_rate,
-                    "bitrate": 3000 if bit_depth == 24 else 1411,
+                    "bitrate": calc_bitrate,
                 }
 
             return None

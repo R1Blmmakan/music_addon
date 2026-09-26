@@ -10,7 +10,7 @@ class Settings(BaseModel):
     public_host: str = os.getenv("PUBLIC_HOST", "http://localhost:8000").rstrip("/")
     deezer_arl: str = os.getenv("DEEZER_ARL", "").strip()
     tidal_token_file: str = os.getenv("TIDAL_TOKEN_FILE", "token.json")
-    tidal_country_code: str = os.getenv("TIDAL_COUNTRY_CODE", "US")
+    tidal_country_code: str = os.getenv("TIDAL_COUNTRY_CODE", "ID")
     preferred_provider: str = os.getenv("PREFERRED_PROVIDER", "tidal").lower()
     enable_fallback: bool = os.getenv("ENABLE_FALLBACK", "true").lower() in ("true", "1", "yes")
     access_token: str = os.getenv("ACCESS_TOKEN", "").strip()

@@ -203,7 +203,7 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
 
     return JSONResponse(
         status_code=404,
-        content={"error": f"Track {item_id} could not be resolved by configured providers."}
+        content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
 @app.get("/diag/td/{track_id}")
