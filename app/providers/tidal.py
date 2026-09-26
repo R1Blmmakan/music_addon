@@ -171,22 +171,19 @@ class TidalProvider(MusicProvider):
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                 })
+            # Prioritize Hi-Res Master tracks and studio releases over soundtrack compilations
+            tracks.sort(key=lambda t: (
+                0 if t.get("audioQuality") == "HI_RES_LOSSLESS" else 1,
+                0 if "soundtrack" not in t.get("album", "").lower() else 1
+            ))
             return tracks
         except Exception as exc:
             logger.error(f"Tidal search failed for '{query}': {exc}")
             return []
 
-    async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
-        """Resolve track ID into signed FLAC CDN URL or DASH manifest."""
-        if not self.is_configured():
-            return None
-
-        clean_id = track_id.replace("td:", "")
-        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
-        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
-
-        data = None
-        for q in qualities_to_try:
+    async def _fetch_playback_info(self, clean_id: str, qualities: list[str]) -> dict | None:
+        """Fetch raw playback info from Tidal across quality tiers."""
+        for q in qualities:
             for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
                 url = f"{API_BASE}/tracks/{clean_id}/{endpoint}"
                 params = {
@@ -202,22 +199,56 @@ class TidalProvider(MusicProvider):
                             resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
                     if resp.status_code == 200:
-                        data = resp.json()
-                        break
+                        return resp.json()
                 except Exception:
                     pass
-            if data:
-                break
+        return None
 
+    async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
+        """Resolve track ID into signed FLAC CDN URL or DASH manifest."""
+        if not self.is_configured():
+            return None
+
+        clean_id = track_id.replace("td:", "")
+        original_id = clean_id
+        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
+        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
+
+        data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
             logger.error(f"Tidal playbackinfo failed for track {clean_id} across all quality tiers")
             return None
 
+        # Auto-upgrade: If Tidal only provides lossy AAC (HIGH) for this specific rendition
+        # (common on some soundtrack albums), find the studio album or single master with Hi-Res/Lossless
+        if data.get("audioQuality") == "HIGH":
+            try:
+                meta_url = f"{API_BASE}/tracks/{clean_id}"
+                meta_resp = await self.client.get(meta_url, headers=self._auth_headers(), params={"countryCode": self.country_code})
+                if meta_resp.status_code == 200:
+                    meta = meta_resp.json()
+                    track_title = meta.get("title", "")
+                    artist_name = meta.get("artist", {}).get("name", "")
+                    if track_title:
+                        lookup_query = f"{track_title} {artist_name}".strip()
+                        candidates = await self.search(lookup_query, limit=10)
+                        for cand in candidates:
+                            cand_id = cand["id"].replace("td:", "")
+                            if cand_id != clean_id:
+                                cand_data = await self._fetch_playback_info(cand_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
+                                if cand_data and cand_data.get("audioQuality") in ("HI_RES_LOSSLESS", "LOSSLESS"):
+                                    logger.info(f"Auto-upgraded track {clean_id} (HIGH) to {cand_id} ({cand_data.get('audioQuality')})")
+                                    clean_id = cand_id
+                                    data = cand_data
+                                    break
+            except Exception as upgrade_err:
+                logger.warning(f"Failed to auto-upgrade track {clean_id}: {upgrade_err}")
+
         try:
             raw_manifest = data.get("manifest")
             mime = data.get("manifestMimeType", "")
-            bit_depth = data.get("bitDepth", 16)
-            sample_rate = data.get("sampleRate", 44100)
+            bit_depth = data.get("bitDepth") or 16
+            sample_rate = data.get("sampleRate") or 44100
 
             # Tidal BTS payload contains base64 encoded JSON with direct CDN URLs
             if "bts" in mime and raw_manifest:
@@ -246,11 +277,13 @@ class TidalProvider(MusicProvider):
                 try:
                     decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
                     self.dash_cache[clean_id] = decoded_xml
+                    if original_id != clean_id:
+                        self.dash_cache[original_id] = decoded_xml
                 except Exception as e:
                     logger.error(f"Failed to decode DASH XML: {e}")
 
                 effective_host = (public_host or self.public_host).rstrip("/")
-                manifest_url = f"{effective_host}/dash/td/{clean_id}.mpd" if effective_host else f"/dash/td/{clean_id}.mpd"
+                manifest_url = f"{effective_host}/dash/td/{original_id}.mpd" if effective_host else f"/dash/td/{original_id}.mpd"
                 return {
                     "url": manifest_url,
                     "format": "flac",
