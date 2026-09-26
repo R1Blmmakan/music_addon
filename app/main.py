@@ -207,14 +207,15 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     )
 
 @app.get("/diag/td/{track_id}")
-async def diag_tidal(track_id: str):
+async def diag_tidal(track_id: str, country: str = ""):
     """Diagnostic endpoint to inspect raw Tidal manifest data."""
     clean_id = track_id.replace("td:", "").replace(".mpd", "")
-    out = {}
+    cc = country or tidal.country_code
+    out = {"countryCode": cc}
     for q in ("HI_RES_LOSSLESS", "LOSSLESS", "HIGH"):
         url = f"https://api.tidal.com/v1/tracks/{clean_id}/playbackinfopostpaywall"
         params = {
-            "countryCode": tidal.country_code,
+            "countryCode": cc,
             "audioquality": q,
             "playbackmode": "STREAM",
             "assetpresentation": "FULL",

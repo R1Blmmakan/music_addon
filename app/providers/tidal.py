@@ -229,11 +229,21 @@ class TidalProvider(MusicProvider):
                     meta = meta_resp.json()
                     track_title = meta.get("title", "")
                     artist_name = meta.get("artist", {}).get("name", "")
+                    orig_duration = float(meta.get("duration", 0))
                     if track_title:
                         lookup_query = f"{track_title} {artist_name}".strip()
                         candidates = await self.search(lookup_query, limit=10)
                         for cand in candidates:
                             cand_id = cand["id"].replace("td:", "")
+                            cand_title = cand.get("title", "").lower()
+                            cand_duration = float(cand.get("duration", 0))
+                            
+                            # Strict match: reject remixes, speed-up, slowed versions, or duration mismatch > 3s
+                            if any(bad in cand_title for bad in ("speed up", "slowed", "remix", "instrumental", "acoustic")):
+                                continue
+                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 3.0:
+                                continue
+
                             if cand_id != clean_id:
                                 cand_data = await self._fetch_playback_info(cand_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
                                 if cand_data and cand_data.get("audioQuality") in ("HI_RES_LOSSLESS", "LOSSLESS"):
@@ -247,8 +257,10 @@ class TidalProvider(MusicProvider):
         try:
             raw_manifest = data.get("manifest")
             mime = data.get("manifestMimeType", "")
-            bit_depth = data.get("bitDepth") or 16
-            sample_rate = data.get("sampleRate") or 44100
+            raw_depth = data.get("bitDepth")
+            raw_rate = data.get("sampleRate")
+            bit_depth = raw_depth or 16
+            sample_rate = raw_rate or 44100
 
             # Tidal BTS payload contains base64 encoded JSON with direct CDN URLs
             if "bts" in mime and raw_manifest:
@@ -258,16 +270,17 @@ class TidalProvider(MusicProvider):
                     if direct_urls:
                         url = direct_urls[0]
                         is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
+                        is_actual_flac = raw_depth is not None and raw_depth >= 16 and "mp4a" not in decoded.get("codecs", "")
                         return {
                             "url": url,
-                            "format": "flac",
-                            "codec": "flac",
+                            "format": "flac" if is_actual_flac else "aac",
+                            "codec": "flac" if is_actual_flac else "aac",
                             "container": "mp4" if is_mp4 else "flac",
                             "manifest": "none",
                             "encrypted": False,
-                            "bitDepth": bit_depth,
-                            "sampleRate": sample_rate,
-                            "bitrate": 1411 if bit_depth == 16 else 3000,
+                            "bitDepth": raw_depth or 16,
+                            "sampleRate": raw_rate or 44100,
+                            "bitrate": 1411 if is_actual_flac else 320,
                         }
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
