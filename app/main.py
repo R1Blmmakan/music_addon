@@ -136,26 +136,27 @@ async def search(q: str, quality: str = "lossless"):
         return {"tracks": []}
 
     tasks = []
+    # Tidal is primary (#1)
     if tidal.is_configured():
-        tasks.append(tidal.search(query, limit=5))
+        tasks.append(tidal.search(query, limit=15))
     else:
         tasks.append(asyncio.sleep(0, result=[]))
 
-    # Deezer search is public and requires no credentials
-    tasks.append(deezer.search(query, limit=5))
+    # Deezer is secondary (#2): only queried if Deezer ARL is configured
+    if deezer.is_configured():
+        tasks.append(deezer.search(query, limit=5))
+    else:
+        tasks.append(asyncio.sleep(0, result=[]))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     tidal_tracks = results[0] if isinstance(results[0], list) else []
     deezer_tracks = results[1] if isinstance(results[1], list) else []
 
-    # Priority sorting: place preferred provider first
+    # Priority sorting: Tidal ALWAYS #1, Deezer follows as backup
     combined = []
-    if settings.preferred_provider == "tidal":
-        combined.extend(tidal_tracks)
+    combined.extend(tidal_tracks)
+    if deezer.is_configured():
         combined.extend(deezer_tracks)
-    else:
-        combined.extend(deezer_tracks)
-        combined.extend(tidal_tracks)
 
     return {"tracks": combined}
 
