@@ -53,7 +53,7 @@ async def security_token_middleware(request: Request, call_next):
     path = request.url.path
 
     # Public diagnostic routes
-    if path in ("/", "/robots.txt", "/favicon.ico"):
+    if path in ("/", "/robots.txt", "/favicon.ico", "/health"):
         return await call_next(request)
 
     # If no ACCESS_TOKEN is set in .env, run in open mode
