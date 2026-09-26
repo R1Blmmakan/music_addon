@@ -4,31 +4,30 @@ services:
     container_name: bitchord-unified-addon
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8100:8000"
     environment:
       - PORT=8000
       # Public URL where BitChord will access this service (HTTPS required for Android)
-      - PUBLIC_HOST=https://addon.yourdomain.com
+      - PUBLIC_HOST=${PUBLIC_HOST:-https://addon.yourdomain.com}
+      # Secret key protecting your endpoints from crawlers and bots
       - ACCESS_TOKEN=${ACCESS_TOKEN:-}
       # Your Deezer ARL token (64 hexadecimal characters)
-      - DEEZER_ARL=your_deezer_arl_token_here
+      - DEEZER_ARL=${DEEZER_ARL:-}
       # Optional: point to local Tidal hifi-api instance if running
-      - TIDAL_API_URL=http://tidal-backend:8080
-      - PREFERRED_PROVIDER=tidal
-      - ENABLE_FALLBACK=true
-    depends_on:
-      - tidal-backend
+      - TIDAL_API_URL=${TIDAL_API_URL:-}
+      - PREFERRED_PROVIDER=deezer
+      - ENABLE_FALLBACK=false
 
-  # Upstream Tidal API engine (optional: comment out if only using Deezer)
-  tidal-backend:
-    image: python:3.11-slim
-    container_name: tidal-backend
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./hifi-api:/app
-    working_dir: /app
-    command: sh -c "pip install --no-cache-dir -r requirements.txt && python main.py"
-    environment:
-      - PORT=8080
+  # Upstream Tidal API engine (optional: uncomment when hifi-api is cloned)
+  # tidal-backend:
+  #   image: python:3.11-slim
+  #   container_name: tidal-backend
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8180:8080"
+  #   volumes:
+  #     - ./hifi-api:/app
+  #   working_dir: /app
+  #   command: sh -c "pip install --no-cache-dir -r requirements.txt && python main.py"
+  #   environment:
+  #     - PORT=8080
