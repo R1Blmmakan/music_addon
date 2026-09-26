@@ -174,7 +174,7 @@ class TidalProvider(MusicProvider):
                 "karaoke", "tribute", "originally performed",
                 "in the style of", "backing track", "piano tribute",
                 "lullaby", "instrumental", "cover", "speed up",
-                "slowed", "acoustic tribute", "made famous by"
+                "sped up", "slowed", "acoustic tribute", "made famous by"
             )
 
             scored_items = []
@@ -195,7 +195,7 @@ class TidalProvider(MusicProvider):
                     if k not in query_lower
                 )
 
-                score = 2000 if is_junk else 0
+                score = 300 if is_junk else 0
 
                 # Title relevance
                 if t_title == query_lower or full_title == query_lower:
@@ -366,8 +366,13 @@ class TidalProvider(MusicProvider):
                                     break
                             if is_excluded:
                                 continue
-                            # 4. Generous duration tolerance (up to 45s) for album intros, spoken lyrics, outro fades
-                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 45.0:
+                            # 4. Smart duration tolerance:
+                            # For standard studio tracks (e.g. 21 Guns, Everlong), up to 45s tolerance accommodates spoken intros / extended fades.
+                            # For tempo-modified variations (slowed, sped up, remix, nightcore, lofi), duration difference must be <= 5.0 seconds
+                            # because BitChord's VersionAudioAligner fails waveform correlation when tempo/duration diverges.
+                            is_tempo_variant = any(k in orig_lower for k in ("slowed", "speed up", "sped up", "remix", "nightcore", "lofi"))
+                            max_diff = 5.0 if is_tempo_variant else 45.0
+                            if orig_duration > 0 and abs(cand_duration - orig_duration) > max_diff:
                                 continue
 
                             if cand_id != clean_id:
@@ -404,17 +409,21 @@ class TidalProvider(MusicProvider):
                             or "flac" in mime_str
                             or ("mp4a" not in codecs_str and audio_q in ("LOSSLESS", "HI_RES_LOSSLESS"))
                         )
+                        if not is_actual_flac:
+                            logger.info(f"Tidal track {clean_id} is only available in lossy ({codecs_str}). Rejecting per FLAC-only rule.")
+                            return None
+
                         is_mp4 = ".mp4" in url.lower() or "mp4" in mime_str
                         return {
                             "url": url,
                             "format": "flac",
-                            "codec": "flac" if is_actual_flac else "aac",
+                            "codec": "flac",
                             "container": "mp4" if is_mp4 else "flac",
                             "manifest": "none",
                             "encrypted": False,
                             "bitDepth": raw_depth or 16,
                             "sampleRate": raw_rate or 44100,
-                            "bitrate": 1411 if is_actual_flac else 320,
+                            "bitrate": 1411,
                         }
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
