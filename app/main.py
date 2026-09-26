@@ -178,12 +178,26 @@ async def search(q: str, quality: str = "lossless"):
 @app.get("/stream/{item_id}")
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
-    # Always enforce FLAC regardless of what BitChord passes in the query param
     quality = "lossless"
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
     dynamic_host = f"{proto}://{host}".rstrip("/")
 
+    try:
+        result = await asyncio.wait_for(
+            _resolve_stream_inner(item_id, quality, dynamic_host),
+            timeout=7.0
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.warning(f"Stream resolution timed out after 7s for {item_id}; returning 404 fast")
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Track {item_id} resolution timed out. Falling back to YouTube Music."}
+        )
+
+async def _resolve_stream_inner(item_id: str, quality: str, dynamic_host: str):
+    """Inner resolution logic, wrapped by resolve_stream with a hard 7s timeout."""
     if item_id.startswith("td:"):
         res = await tidal.get_stream(item_id, quality, public_host=dynamic_host)
         if res and res.get("url"):
@@ -196,13 +210,23 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
                 return fallback_stream
 
     if item_id.startswith("dz:"):
-        res = await deezer.get_stream(item_id, quality)
+        # Run Deezer CDN resolution and Tidal fallback pre-fetch in parallel.
+        # Tidal search starts immediately so fallback is ready the moment Deezer fails,
+        # instead of adding a full extra Tidal round-trip after Deezer confirms failure.
+        deezer_task = asyncio.create_task(deezer.get_stream(item_id, quality))
+        tidal_prefetch = None
+        if settings.enable_fallback and tidal.is_configured():
+            tidal_prefetch = asyncio.create_task(_deezer_to_tidal_fallback(item_id, quality, dynamic_host))
+
+        res = await deezer_task
         if res and res.get("url"):
+            if tidal_prefetch:
+                tidal_prefetch.cancel()
             return res
 
-        if settings.enable_fallback and tidal.is_configured():
-            logger.info(f"Deezer track {item_id} failed; falling back to Tidal by title search")
-            fallback_stream = await _deezer_to_tidal_fallback(item_id, quality, dynamic_host)
+        if tidal_prefetch:
+            logger.info(f"Deezer track {item_id} failed; awaiting parallel Tidal fallback")
+            fallback_stream = await tidal_prefetch
             if fallback_stream:
                 return fallback_stream
 

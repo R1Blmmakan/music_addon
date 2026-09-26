@@ -291,15 +291,21 @@ class TidalProvider(MusicProvider):
             return []
 
     async def _fetch_playback_info(self, clean_id: str, qualities: list[str]) -> dict | None:
-        """Fetch raw playback info from Tidal across quality tiers with country fallback."""
+        """Fetch raw playback info from Tidal across quality tiers with country fallback.
+
+        Loop order: quality → endpoint → country.
+        Exhausts all countries for the primary endpoint (postpaywall) before trying the
+        secondary endpoint. This keeps the fast-path (primary endpoint, home country, first
+        quality) to a single request for most tracks.
+        """
         countries = [self.country_code]
         for fallback_cc in ("ID", "GB", "US"):
             if fallback_cc not in countries:
                 countries.append(fallback_cc)
 
         for q in qualities:
-            for cc in countries:
-                for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
+            for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
+                for cc in countries:
                     url = f"{API_BASE}/tracks/{clean_id}/{endpoint}"
                     params = {
                         "countryCode": cc,
@@ -352,7 +358,7 @@ class TidalProvider(MusicProvider):
 
                     if track_title and artist_name:
                         lookup_query = f"{track_title} {artist_name}".strip()
-                        candidates = await self.search(lookup_query, limit=10)
+                        candidates = await self.search(lookup_query, limit=5)
                         for cand in candidates:
                             cand_id = cand["id"].replace("td:", "")
                             cand_title = cand.get("title", "").strip().lower()
