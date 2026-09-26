@@ -25,3 +25,8 @@ env/
 *.swo
 .DS_Store
 Thumbs.db
+
+# App and debug files
+bitchord.apk
+*.log
+scratch_test*

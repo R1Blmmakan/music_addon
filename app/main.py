@@ -207,13 +207,42 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     )
 
 @app.get("/diag/proxy")
-async def diag_proxy(path: str, country: str = ""):
+async def diag_proxy(request: Request, path: str):
     """Proxy authenticated diagnostic query to Tidal API."""
-    cc = country or tidal.country_code
+    qp = dict(request.query_params)
+    qp.pop("path", None)
+    cc = qp.pop("country", None) or qp.get("countryCode") or tidal.country_code
+    qp["countryCode"] = cc
     url = f"https://api.tidal.com/v1/{path.lstrip('/')}"
-    params = {"countryCode": cc}
-    resp = await tidal.client.get(url, headers=tidal._auth_headers(), params=params)
+    resp = await tidal.client.get(url, headers=tidal._auth_headers(), params=qp)
     return Response(content=resp.text, media_type="application/json")
+
+@app.get("/diag/search")
+async def diag_search(q: str, country: str = ""):
+    """Diagnostic endpoint to test Tidal search without authentication."""
+    old_cc = tidal.country_code
+    if country:
+        tidal.country_code = country
+    try:
+        results = await tidal.search(q, limit=10)
+        return {"activeCountry": tidal.country_code, "count": len(results), "tracks": results}
+    finally:
+        tidal.country_code = old_cc
+
+@app.get("/diag/stream/{item_id}")
+async def diag_stream(item_id: str, request: Request, country: str = ""):
+    """Diagnostic endpoint to test track stream resolution without authentication."""
+    old_cc = tidal.country_code
+    if country:
+        tidal.country_code = country
+    try:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+        dynamic_host = f"{proto}://{host}".rstrip("/")
+        stream = await tidal.get_stream(item_id, "lossless", public_host=dynamic_host)
+        return {"activeCountry": tidal.country_code, "stream": stream}
+    finally:
+        tidal.country_code = old_cc
 
 @app.get("/diag/td/{track_id}")
 async def diag_tidal(track_id: str, country: str = ""):
@@ -253,6 +282,45 @@ async def diag_tidal(track_id: str, country: str = ""):
         except Exception as exc:
             out[q] = {"error": str(exc)}
     return out
+
+@app.get("/dash/td/{track_id}/init.mp4")
+async def serve_dash_init(track_id: str):
+    """Serve patched DASH fMP4 initialization segment with valid non-zero sampleRate for ExoPlayer."""
+    clean_id = track_id.replace("td:", "").replace(".mpd", "").replace("/init.mp4", "")
+    patched_init = tidal.init_segment_cache.get(clean_id)
+    if not patched_init:
+        init_url = tidal.init_url_cache.get(clean_id)
+        if not init_url:
+            await tidal.get_stream(clean_id)
+            init_url = tidal.init_url_cache.get(clean_id)
+        if init_url:
+            try:
+                resp = await tidal.client.get(init_url)
+                if resp.status_code == 200:
+                    raw_bytes = bytearray(resp.content)
+                    flac_pos = raw_bytes.find(b"fLaC")
+                    if flac_pos != -1 and len(raw_bytes) >= flac_pos + 32:
+                        rate_pos = flac_pos + 28
+                        if raw_bytes[rate_pos:rate_pos+4] == b"\x00\x00\x00\x00":
+                            # Patch 16.16 fixed point sample rate to 44.1kHz (0xAC440000)
+                            raw_bytes[rate_pos:rate_pos+4] = b"\xAC\x44\x00\x00"
+                    patched_init = bytes(raw_bytes)
+                    tidal.init_segment_cache[clean_id] = patched_init
+            except Exception as e:
+                logger.error(f"Failed to fetch and patch init segment for track {clean_id}: {e}")
+
+    if not patched_init:
+        raise HTTPException(status_code=404, detail="Init segment not found")
+
+    return Response(
+        content=patched_init,
+        media_type="audio/mp4",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Content-Length": str(len(patched_init)),
+            "Accept-Ranges": "bytes",
+        }
+    )
 
 @app.get("/dash/td/{track_id}")
 async def serve_dash_manifest(track_id: str):

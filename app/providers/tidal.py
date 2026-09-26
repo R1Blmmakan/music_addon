@@ -26,6 +26,8 @@ class TidalProvider(MusicProvider):
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
         self.dash_cache: dict[str, str] = {}
+        self.init_url_cache: dict[str, str] = {}
+        self.init_segment_cache: dict[str, bytes] = {}
         self._load_token()
 
     @property
@@ -119,7 +121,7 @@ class TidalProvider(MusicProvider):
             return False
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
-        """Search Tidal catalogue for tracks."""
+        """Search Tidal catalogue for tracks with multi-country fallback and smart scoring."""
         if not self.is_configured():
             return []
 
@@ -127,29 +129,41 @@ class TidalProvider(MusicProvider):
         if not clean_query:
             return []
 
-        url = f"{API_BASE}/search/tracks"
-        params = {
-            "query": clean_query,
-            "limit": max(limit * 3, 30),
-            "offset": 0,
-            "countryCode": self.country_code,
-        }
-
         try:
-            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-            if resp.status_code == 401:
-                if await self._refresh_access_token():
-                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+            url = f"{API_BASE}/search/tracks"
+            countries_to_try = [self.country_code]
+            for fallback_cc in ("ID", "GB", "US"):
+                if fallback_cc not in countries_to_try:
+                    countries_to_try.append(fallback_cc)
 
-            if resp.status_code != 200:
-                logger.error(f"Tidal search error ({resp.status_code}): {resp.text[:200]}")
+            items = []
+            for cc in countries_to_try:
+                params = {
+                    "query": clean_query,
+                    "limit": max(limit * 3, 30),
+                    "offset": 0,
+                    "countryCode": cc,
+                }
+                try:
+                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                    if resp.status_code == 401:
+                        if await self._refresh_access_token():
+                            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        cand_items = data.get("items", [])
+                        if cand_items:
+                            items = cand_items
+                            break
+                except Exception as e:
+                    logger.warning(f"Tidal search attempt failed for country {cc}: {e}")
+
+            if not items:
                 return []
 
-            data = resp.json()
-            items = data.get("items", [])
-
             # Smart relevance scoring:
-            # 1. Demote karaoke, covers, tributes, instrumentals, speed up/slowed versions
+            # 1. Demote karaoke, covers, tributes, instrumentals, speed up/slowed versions (unless requested)
             # 2. Boost exact and partial title matches
             # 3. Boost artist name matches and multi-token title+artist queries
             # 4. Factor in popularity so original studio hits rank #1
@@ -218,25 +232,26 @@ class TidalProvider(MusicProvider):
                 if is_hi_res:
                     score -= 150
                 if "soundtrack" in t_album or "compilation" in t_album:
-                    score += 150
+                    score += 250
 
-                # Factor in popularity
-                score -= popularity * 2
-
+                # Popularity as secondary tiebreaker (subtract up to 100 points)
+                score -= min(popularity, 100)
                 scored_items.append((score, idx, item))
 
             scored_items.sort(key=lambda x: (x[0], x[1]))
-            sorted_items = [x[2] for x in scored_items]
+            best_items = [x[2] for x in scored_items]
 
             tracks = []
-            for item in sorted_items:
-                tags = item.get("mediaMetadata", {}).get("tags", [])
+            for item in best_items:
+                audio_modes = item.get("audioModes", [])
+                is_atmos = "DOLBY_ATMOS" in audio_modes
+                media_meta = item.get("mediaMetadata", {})
+                tags = media_meta.get("tags", [])
                 is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
-                is_atmos = "DOLBY_ATMOS" in tags or "DOLBY_ATMOS" in item.get("audioModes", [])
                 is_lossless = is_hi_res or "LOSSLESS" in tags or item.get("audioQuality") == "LOSSLESS"
 
                 cover_hash = item.get("album", {}).get("cover")
-                artwork = None
+                artwork = ""
                 if cover_hash:
                     artwork = f"https://resources.tidal.com/images/{cover_hash.replace('-', '/')}/1280x1280.jpg"
 
@@ -262,31 +277,37 @@ class TidalProvider(MusicProvider):
             return []
 
     async def _fetch_playback_info(self, clean_id: str, qualities: list[str]) -> dict | None:
-        """Fetch raw playback info from Tidal across quality tiers."""
+        """Fetch raw playback info from Tidal across quality tiers with country fallback."""
+        countries = [self.country_code]
+        for fallback_cc in ("ID", "GB", "US"):
+            if fallback_cc not in countries:
+                countries.append(fallback_cc)
+
         for q in qualities:
-            for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
-                url = f"{API_BASE}/tracks/{clean_id}/{endpoint}"
-                params = {
-                    "countryCode": self.country_code,
-                    "audioquality": q,
-                    "playbackmode": "STREAM",
-                    "assetpresentation": "FULL",
-                }
-                try:
-                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-                    if resp.status_code == 401:
-                        if await self._refresh_access_token():
+            for cc in countries:
+                for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
+                    url = f"{API_BASE}/tracks/{clean_id}/{endpoint}"
+                    params = {
+                        "countryCode": cc,
+                        "audioquality": q,
+                        "playbackmode": "STREAM",
+                        "assetpresentation": "FULL",
+                    }
+                    try:
+                        resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                        if resp.status_code == 401:
+                            if await self._refresh_access_token():
+                                resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+
+                        if resp.status_code == 429:
+                            logger.warning(f"Tidal rate limit (429) on track {clean_id}. Retrying after 1.5s...")
+                            await asyncio.sleep(1.5)
                             resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
-                    if resp.status_code == 429:
-                        logger.warning(f"Tidal rate limit (429) on track {clean_id}. Retrying after 1.5s...")
-                        await asyncio.sleep(1.5)
-                        resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-
-                    if resp.status_code == 200:
-                        return resp.json()
-                except Exception:
-                    pass
+                        if resp.status_code == 200:
+                            return resp.json()
+                    except Exception:
+                        pass
         return None
 
     async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
@@ -325,8 +346,10 @@ class TidalProvider(MusicProvider):
                             cand_artist = cand.get("artist", "").strip().lower()
                             cand_duration = float(cand.get("duration", 0))
 
-                            # 1. Exact artist match (strictly NO cover singers)
-                            if cand_artist != artist_name.lower():
+                            # 1. Flexible artist match (handles collaborations e.g. "Post Malone, Swae Lee" vs "Post Malone")
+                            c_art = cand_artist.lower()
+                            o_art = artist_name.lower()
+                            if c_art != o_art and c_art not in o_art and o_art not in c_art:
                                 continue
                             # 2. Clean base title match (handles radio edits / album versions)
                             import re
@@ -334,8 +357,8 @@ class TidalProvider(MusicProvider):
                             cand_base = re.sub(r'\(.*?\)|\[.*?\]', '', cand_title).strip().lower()
                             if cand_base != orig_base:
                                 continue
-                            # 3. Reject covers, remixes, instrumentals, live versions (unless requested)
-                            orig_lower = track_title.lower()
+                            # 3. Reject covers, remixes, instrumentals, live versions (unless requested in original track)
+                            orig_lower = (track_title + " " + artist_name).lower()
                             is_excluded = False
                             for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic", "live"):
                                 if bad in cand_title and bad not in orig_lower:
@@ -396,10 +419,24 @@ class TidalProvider(MusicProvider):
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
 
-            # Tidal DASH manifest payload: serve via proper HTTP endpoint
+            # Tidal DASH manifest payload: serve via proper HTTP endpoint with patched init segment
             if "dash" in mime and raw_manifest:
                 try:
                     decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
+                    effective_host = (public_host or self.public_host).rstrip("/")
+
+                    # Intercept and rewrite initialization segment to our patched endpoint
+                    # so ExoPlayer's FragmentedMp4Extractor does not fail on sampleRate=0
+                    import re
+                    init_match = re.search(r'initialization="([^"]+)"', decoded_xml)
+                    if init_match:
+                        orig_init_url = init_match.group(1)
+                        self.init_url_cache[clean_id] = orig_init_url
+                        if original_id != clean_id:
+                            self.init_url_cache[original_id] = orig_init_url
+                        patched_init_url = f"{effective_host}/dash/td/{original_id}/init.mp4" if effective_host else f"/dash/td/{original_id}/init.mp4"
+                        decoded_xml = decoded_xml.replace(init_match.group(0), f'initialization="{patched_init_url}"')
+
                     self.dash_cache[clean_id] = decoded_xml
                     if original_id != clean_id:
                         self.dash_cache[original_id] = decoded_xml
