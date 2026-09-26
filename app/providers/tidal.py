@@ -128,7 +128,7 @@ class TidalProvider(MusicProvider):
         url = f"{API_BASE}/search/tracks"
         params = {
             "query": clean_query,
-            "limit": limit,
+            "limit": max(limit * 3, 30),
             "offset": 0,
             "countryCode": self.country_code,
         }
@@ -146,8 +146,79 @@ class TidalProvider(MusicProvider):
             data = resp.json()
             items = data.get("items", [])
 
+            # Smart relevance scoring:
+            # 1. Demote karaoke, covers, tributes, instrumentals, speed up/slowed versions
+            # 2. Boost exact and partial title matches
+            # 3. Boost artist name matches and multi-token title+artist queries
+            # 4. Factor in popularity so original studio hits rank #1
+            query_lower = clean_query.lower()
+            query_words = [w for w in query_lower.split() if len(w) > 1]
+
+            junk_keywords = (
+                "karaoke", "tribute", "originally performed",
+                "in the style of", "backing track", "piano tribute",
+                "lullaby", "instrumental", "cover", "speed up",
+                "slowed", "acoustic tribute", "made famous by"
+            )
+
+            scored_items = []
+            for idx, item in enumerate(items):
+                if item.get("type") == "video":
+                    continue
+
+                t_title = item.get("title", "").strip().lower()
+                t_version = (item.get("version") or "").strip().lower()
+                full_title = f"{t_title} {t_version}".strip()
+                t_artist = item.get("artist", {}).get("name", "").strip().lower()
+                popularity = int(item.get("popularity", 0) or 0)
+
+                # Demote junk unless explicitly requested in query
+                is_junk = any(
+                    k in full_title or k in t_artist
+                    for k in junk_keywords
+                    if k not in query_lower
+                )
+
+                score = 2000 if is_junk else 0
+
+                # Title relevance
+                if t_title == query_lower or full_title == query_lower:
+                    score -= 600
+                elif full_title.startswith(query_lower):
+                    score -= 400
+                elif query_lower in full_title:
+                    score -= 300
+                elif query_words and any(w in t_title for w in query_words):
+                    matched_title_words = sum(1 for w in query_words if w in t_title)
+                    score -= 150 * matched_title_words
+                else:
+                    # Title has no overlap with query (e.g. artist match only)
+                    score += 400
+
+                # Artist relevance
+                if t_artist == query_lower or query_lower in t_artist:
+                    score -= 300
+                elif query_words and any(w in t_artist for w in query_words):
+                    matched_artist_words = sum(1 for w in query_words if w in t_artist)
+                    score -= 100 * matched_artist_words
+
+                # Multi-token synergy (query contains words matching both title and artist)
+                if len(query_words) >= 2:
+                    has_title_match = any(w in t_title for w in query_words)
+                    has_artist_match = any(w in t_artist for w in query_words)
+                    if has_title_match and has_artist_match:
+                        score -= 400
+
+                # Factor in popularity
+                score -= popularity * 2
+
+                scored_items.append((score, idx, item))
+
+            scored_items.sort(key=lambda x: (x[0], x[1]))
+            sorted_items = [x[2] for x in scored_items]
+
             tracks = []
-            for item in items[:limit]:
+            for item in sorted_items[:limit]:
                 tags = item.get("mediaMetadata", {}).get("tags", [])
                 is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
                 is_atmos = "DOLBY_ATMOS" in tags or "DOLBY_ATMOS" in item.get("audioModes", [])
@@ -171,11 +242,6 @@ class TidalProvider(MusicProvider):
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                 })
-            # Prioritize Hi-Res Master tracks and studio releases over soundtrack compilations
-            tracks.sort(key=lambda t: (
-                0 if t.get("audioQuality") == "HI_RES_LOSSLESS" else 1,
-                0 if "soundtrack" not in t.get("album", "").lower() else 1
-            ))
             return tracks
         except Exception as exc:
             logger.error(f"Tidal search failed for '{query}': {exc}")
@@ -205,54 +271,18 @@ class TidalProvider(MusicProvider):
         return None
 
     async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
-        """Resolve track ID into signed FLAC CDN URL or DASH manifest."""
+        """Resolve track ID into signed FLAC CDN URL or DASH manifest without track swapping."""
         if not self.is_configured():
             return None
 
         clean_id = track_id.replace("td:", "")
-        original_id = clean_id
-        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
+        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC) and High (320k)
         qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
 
         data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
             logger.error(f"Tidal playbackinfo failed for track {clean_id} across all quality tiers")
             return None
-
-        # Auto-upgrade: If Tidal only provides lossy AAC (HIGH) for this specific rendition
-        # (common on some soundtrack albums), find the studio album or single master with Hi-Res/Lossless
-        if data.get("audioQuality") == "HIGH":
-            try:
-                meta_url = f"{API_BASE}/tracks/{clean_id}"
-                meta_resp = await self.client.get(meta_url, headers=self._auth_headers(), params={"countryCode": self.country_code})
-                if meta_resp.status_code == 200:
-                    meta = meta_resp.json()
-                    track_title = meta.get("title", "")
-                    artist_name = meta.get("artist", {}).get("name", "")
-                    orig_duration = float(meta.get("duration", 0))
-                    if track_title:
-                        lookup_query = f"{track_title} {artist_name}".strip()
-                        candidates = await self.search(lookup_query, limit=10)
-                        for cand in candidates:
-                            cand_id = cand["id"].replace("td:", "")
-                            cand_title = cand.get("title", "").lower()
-                            cand_duration = float(cand.get("duration", 0))
-                            
-                            # Strict match: reject remixes, speed-up, slowed versions, or duration mismatch > 3s
-                            if any(bad in cand_title for bad in ("speed up", "slowed", "remix", "instrumental", "acoustic")):
-                                continue
-                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 3.0:
-                                continue
-
-                            if cand_id != clean_id:
-                                cand_data = await self._fetch_playback_info(cand_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
-                                if cand_data and cand_data.get("audioQuality") in ("HI_RES_LOSSLESS", "LOSSLESS"):
-                                    logger.info(f"Auto-upgraded track {clean_id} (HIGH) to {cand_id} ({cand_data.get('audioQuality')})")
-                                    clean_id = cand_id
-                                    data = cand_data
-                                    break
-            except Exception as upgrade_err:
-                logger.warning(f"Failed to auto-upgrade track {clean_id}: {upgrade_err}")
 
         try:
             raw_manifest = data.get("manifest")
@@ -262,7 +292,7 @@ class TidalProvider(MusicProvider):
             bit_depth = raw_depth or 16
             sample_rate = raw_rate or 44100
 
-            # Tidal BTS payload contains base64 encoded JSON with direct CDN URLs
+            # Direct progressive stream (BTS payload)
             if "bts" in mime and raw_manifest:
                 try:
                     decoded = json.loads(base64.b64decode(raw_manifest).decode("utf-8"))
@@ -273,7 +303,7 @@ class TidalProvider(MusicProvider):
                         is_actual_flac = raw_depth is not None and raw_depth >= 16 and "mp4a" not in decoded.get("codecs", "")
                         return {
                             "url": url,
-                            "format": "flac" if is_actual_flac else "aac",
+                            "format": "flac",
                             "codec": "flac" if is_actual_flac else "aac",
                             "container": "mp4" if is_mp4 else "flac",
                             "manifest": "none",
@@ -285,18 +315,16 @@ class TidalProvider(MusicProvider):
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
 
-            # Tidal DASH manifest payload: serve via proper HTTP endpoint instead of unplayable data URI
+            # Tidal DASH manifest payload: serve via proper HTTP endpoint
             if "dash" in mime and raw_manifest:
                 try:
                     decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
                     self.dash_cache[clean_id] = decoded_xml
-                    if original_id != clean_id:
-                        self.dash_cache[original_id] = decoded_xml
                 except Exception as e:
                     logger.error(f"Failed to decode DASH XML: {e}")
 
                 effective_host = (public_host or self.public_host).rstrip("/")
-                manifest_url = f"{effective_host}/dash/td/{original_id}.mpd" if effective_host else f"/dash/td/{original_id}.mpd"
+                manifest_url = f"{effective_host}/dash/td/{clean_id}.mpd" if effective_host else f"/dash/td/{clean_id}.mpd"
                 return {
                     "url": manifest_url,
                     "format": "flac",
