@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import httpx
 from typing import AsyncGenerator
 from app.providers.base import MusicProvider
@@ -94,6 +94,7 @@ class DeezerProvider(MusicProvider):
                     "artworkURL": artwork,
                     "format": "flac",
                     "audioQuality": "LOSSLESS",
+                    "bitrate": 1411,
                 })
             return tracks
         except Exception as exc:

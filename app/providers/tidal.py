@@ -159,6 +159,7 @@ class TidalProvider(MusicProvider):
                     "artworkURL": artwork,
                     "format": "flac",
                     "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else "LOSSLESS",
+                    "bitrate": 3000 if is_hi_res else 1411,
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                 })

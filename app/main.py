@@ -161,6 +161,8 @@ async def search(q: str, quality: str = "lossless"):
 
 @app.get("/stream/{item_id}")
 async def resolve_stream(item_id: str, quality: str = "lossless"):
+    # Enforce strictly lossless FLAC: ignore any low or 96k request
+    quality = "lossless"
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
     # Handle Tidal items
     if item_id.startswith("td:"):
