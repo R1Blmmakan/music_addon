@@ -273,6 +273,11 @@ class TidalProvider(MusicProvider):
                         if await self._refresh_access_token():
                             resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
+                    if resp.status_code == 429:
+                        logger.warning(f"Tidal rate limit (429) on track {clean_id}. Retrying after 1.5s...")
+                        await asyncio.sleep(1.5)
+                        resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+
                     if resp.status_code == 200:
                         return resp.json()
                 except Exception:
