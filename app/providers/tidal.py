@@ -363,8 +363,16 @@ class TidalProvider(MusicProvider):
                     direct_urls = decoded.get("urls", [])
                     if direct_urls:
                         url = direct_urls[0]
-                        is_actual_flac = raw_depth is not None and raw_depth >= 16 and "mp4a" not in decoded.get("codecs", "")
-                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
+                        codecs_str = decoded.get("codecs", "").lower()
+                        mime_str = decoded.get("mimeType", "").lower()
+                        audio_q = data.get("audioQuality", "").upper()
+
+                        is_actual_flac = (
+                            "flac" in codecs_str
+                            or "flac" in mime_str
+                            or ("mp4a" not in codecs_str and audio_q in ("LOSSLESS", "HI_RES_LOSSLESS"))
+                        )
+                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime_str
                         return {
                             "url": url,
                             "format": "flac",
