@@ -176,11 +176,8 @@ class TidalProvider(MusicProvider):
             return None
 
         clean_id = track_id.replace("td:", "")
-        wanted_quality = "HI_RES_LOSSLESS" if quality.lower() in ("lossless", "max", "hi-res") else "LOSSLESS"
-
-        qualities_to_try = [wanted_quality]
-        if wanted_quality != "LOSSLESS":
-            qualities_to_try.append("LOSSLESS")
+        # Prioritize direct single-file FLAC (BTS) over multi-segment DASH for bulletproof ExoPlayer playback
+        qualities_to_try = ["LOSSLESS", "HI_RES_LOSSLESS", "HIGH"]
 
         data = None
         for q in qualities_to_try:
