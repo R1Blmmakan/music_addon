@@ -54,8 +54,8 @@ class TidalProvider(MusicProvider):
         if not self.token_data or not self.token_data.get("refresh_token"):
             return False
 
-        client_id = self.token_data.get("client_id", "fX2JxdmntZWK0ixT")
-        client_secret = self.token_data.get("client_secret", "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=")
+        client_id = self.token_data.get("client_id", "zU4XHVVkc2tDPo4t")
+        client_secret = self.token_data.get("client_secret", "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=")
         refresh_token = self.token_data["refresh_token"]
 
         data = {
