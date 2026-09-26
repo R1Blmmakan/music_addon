@@ -31,7 +31,13 @@ async def lifespan(app: FastAPI):
         logger.info(f"Tidal status: {'Ready' if td_ok else 'Unreachable'}")
     else:
         logger.info("Tidal token.json not found. Run python app/auth_tidal.py to enable Tidal.")
+
+    logger.info(f"Preferred provider: {settings.preferred_provider.upper()} | Fallback: {settings.enable_fallback} | Diag routes: {settings.diag_enabled}")
     yield
+
+    # Close HTTP clients on shutdown to avoid connection leaks
+    await deezer.client.aclose()
+    await tidal.client.aclose()
 
 app = FastAPI(
     title="BitChord Unified Lossless Addon",
@@ -53,25 +59,33 @@ async def security_token_middleware(request: Request, call_next):
     token = settings.access_token
     path = request.url.path
 
-    # Public diagnostic routes
-    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/") or path.startswith("/diag/"):
+    # /diag/* routes require DIAG_ENABLED=true: they proxy your Bearer token to Tidal
+    if path.startswith("/diag/"):
+        if not settings.diag_enabled:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Diagnostic routes are disabled. Set DIAG_ENABLED=true in .env to enable."}
+            )
+        if token and request.query_params.get("token") != token and request.headers.get("X-Access-Token") != token:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized."})
         return await call_next(request)
 
-    # If no ACCESS_TOKEN is set in .env, run in open mode
+    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/"):
+        return await call_next(request)
+
+    # Open mode when no ACCESS_TOKEN configured
     if not token:
         return await call_next(request)
 
-    # Check if path starts with /{token}/ or /{token}
+    # Path-prefix token: https://host/{token}/manifest.json
     token_prefix = f"/{token}"
     if path == token_prefix or path.startswith(f"{token_prefix}/"):
-        # Strip token prefix so internal route matches normally
         stripped_path = path[len(token_prefix):]
         if not stripped_path:
             stripped_path = "/"
         request.scope["path"] = stripped_path
         return await call_next(request)
 
-    # Check alternative query parameter or header authentication
     if (
         request.query_params.get("token") == token
         or request.headers.get("X-Access-Token") == token
@@ -89,7 +103,7 @@ async def dashboard():
     """Interactive status landing page for homelab and portfolio display."""
     dz_configured = deezer.is_configured()
     td_configured = tidal.is_configured()
-    
+
     with open("app/templates/dashboard.html", "r", encoding="utf-8") as f:
         html = f.read()
 
@@ -131,21 +145,22 @@ async def manifest():
 
 @app.get("/search")
 async def search(q: str, quality: str = "lossless"):
-    """Multi-provider search aggregation with lossless priority ranking."""
+    """Multi-provider search aggregation respecting PREFERRED_PROVIDER order."""
     query = q.strip()
     if not query:
         return {"tracks": []}
 
+    tidal_limit = 15 if settings.preferred_provider == "tidal" else 8
+    deezer_limit = 15 if settings.preferred_provider == "deezer" else 8
+
     tasks = []
-    # Tidal is primary (#1)
     if tidal.is_configured():
-        tasks.append(tidal.search(query, limit=15))
+        tasks.append(tidal.search(query, limit=tidal_limit))
     else:
         tasks.append(asyncio.sleep(0, result=[]))
 
-    # Deezer is secondary (#2): only queried if Deezer ARL is configured
     if deezer.is_configured():
-        tasks.append(deezer.search(query, limit=5))
+        tasks.append(deezer.search(query, limit=deezer_limit))
     else:
         tasks.append(asyncio.sleep(0, result=[]))
 
@@ -153,58 +168,109 @@ async def search(q: str, quality: str = "lossless"):
     tidal_tracks = results[0] if isinstance(results[0], list) else []
     deezer_tracks = results[1] if isinstance(results[1], list) else []
 
-    # Priority sorting: Tidal ALWAYS #1, Deezer follows as backup
-    combined = []
-    combined.extend(tidal_tracks)
-    if deezer.is_configured():
-        combined.extend(deezer_tracks)
+    if settings.preferred_provider == "deezer":
+        combined = deezer_tracks + tidal_tracks
+    else:
+        combined = tidal_tracks + deezer_tracks
 
     return {"tracks": combined}
 
 @app.get("/stream/{item_id}")
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
-    # Enforce strictly lossless FLAC: ignore any low or 96k request
-    quality = "lossless"
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
+    # Always enforce FLAC regardless of what BitChord passes in the query param
+    quality = "lossless"
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
     dynamic_host = f"{proto}://{host}".rstrip("/")
 
-    # Handle Tidal items
     if item_id.startswith("td:"):
         res = await tidal.get_stream(item_id, quality, public_host=dynamic_host)
         if res and res.get("url"):
             return res
 
-        # Tidal failed: attempt fallback to Deezer if enabled
         if settings.enable_fallback and deezer.is_configured():
-            logger.info(f"Tidal track {item_id} resolution failed; attempting Deezer fallback")
-            # Extract track metadata or query Deezer
-            dz_matches = await deezer.search(item_id.replace("td:", ""), limit=1)
-            if dz_matches:
-                fallback_stream = await deezer.get_stream(dz_matches[0]["id"], quality)
-                if fallback_stream:
-                    return fallback_stream
+            logger.info(f"Tidal track {item_id} failed; falling back to Deezer by title search")
+            fallback_stream = await _tidal_to_deezer_fallback(item_id, quality)
+            if fallback_stream:
+                return fallback_stream
 
-    # Handle Deezer items
     if item_id.startswith("dz:"):
         res = await deezer.get_stream(item_id, quality)
         if res and res.get("url"):
             return res
 
-        # Deezer failed: attempt fallback to Tidal if enabled
         if settings.enable_fallback and tidal.is_configured():
-            logger.info(f"Deezer track {item_id} resolution failed; attempting Tidal fallback")
-            td_matches = await tidal.search(item_id.replace("dz:", ""), limit=1)
-            if td_matches:
-                fallback_stream = await tidal.get_stream(td_matches[0]["id"], quality)
-                if fallback_stream:
-                    return fallback_stream
+            logger.info(f"Deezer track {item_id} failed; falling back to Tidal by title search")
+            fallback_stream = await _deezer_to_tidal_fallback(item_id, quality, dynamic_host)
+            if fallback_stream:
+                return fallback_stream
 
     return JSONResponse(
         status_code=404,
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
+
+async def _tidal_to_deezer_fallback(item_id: str, quality: str) -> dict | None:
+    """Fetch track title+artist from Tidal, then search Deezer by name for cross-provider fallback.
+
+    Searching by the raw numeric ID would match random Deezer tracks, causing wrong-song playback.
+    """
+    from app.providers.tidal import API_BASE
+    clean_id = item_id.replace("td:", "")
+    try:
+        meta_resp = await tidal.client.get(
+            f"{API_BASE}/tracks/{clean_id}",
+            headers=tidal._auth_headers(),
+            params={"countryCode": tidal.country_code}
+        )
+        if meta_resp.status_code != 200:
+            return None
+        meta = meta_resp.json()
+        title = meta.get("title", "").strip()
+        artist = meta.get("artist", {}).get("name", "").strip()
+        if not title or not artist:
+            return None
+        query = f"{title} {artist}"
+    except Exception as exc:
+        logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
+        return None
+
+    dz_matches = await deezer.search(query, limit=3)
+    for match in dz_matches:
+        stream = await deezer.get_stream(match["id"], quality)
+        if stream and stream.get("url"):
+            logger.info(f"Deezer fallback resolved '{query}' to {match['id']}")
+            return stream
+    return None
+
+async def _deezer_to_tidal_fallback(item_id: str, quality: str, dynamic_host: str) -> dict | None:
+    """Fetch track title+artist from Deezer public API, then search Tidal for cross-provider fallback.
+
+    Same issue as Tidal-to-Deezer: searching by raw numeric ID returns garbage.
+    """
+    clean_id = item_id.replace("dz:", "")
+    try:
+        meta_resp = await deezer.client.get(f"https://api.deezer.com/track/{clean_id}")
+        if meta_resp.status_code != 200:
+            return None
+        meta = meta_resp.json()
+        title = meta.get("title", "").strip()
+        artist = meta.get("artist", {}).get("name", "").strip()
+        if not title or not artist:
+            return None
+        query = f"{title} {artist}"
+    except Exception as exc:
+        logger.warning(f"Could not fetch Deezer metadata for {clean_id}: {exc}")
+        return None
+
+    td_matches = await tidal.search(query, limit=3)
+    for match in td_matches:
+        stream = await tidal.get_stream(match["id"], quality, public_host=dynamic_host)
+        if stream and stream.get("url"):
+            logger.info(f"Tidal fallback resolved '{query}' to {match['id']}")
+            return stream
+    return None
 
 @app.get("/diag/proxy")
 async def diag_proxy(request: Request, path: str):

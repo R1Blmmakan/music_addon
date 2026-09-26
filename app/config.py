@@ -1,4 +1,4 @@
-﻿import os
+import os
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -11,8 +11,11 @@ class Settings(BaseModel):
     deezer_arl: str = os.getenv("DEEZER_ARL", "").strip()
     tidal_token_file: str = os.getenv("TIDAL_TOKEN_FILE", "token.json")
     tidal_country_code: str = os.getenv("TIDAL_COUNTRY_CODE", "ID")
+    # "deezer" or "tidal" -- controls search result order and primary stream resolution
     preferred_provider: str = os.getenv("PREFERRED_PROVIDER", "tidal").lower()
     enable_fallback: bool = os.getenv("ENABLE_FALLBACK", "true").lower() in ("true", "1", "yes")
     access_token: str = os.getenv("ACCESS_TOKEN", "").strip()
+    # /diag/* routes are disabled by default: they forward your Bearer token to arbitrary Tidal endpoints
+    diag_enabled: bool = os.getenv("DIAG_ENABLED", "false").lower() in ("true", "1", "yes")
 
 settings = Settings()

@@ -1,13 +1,14 @@
-﻿"""
-Native Tidal Music Provider
-Communicates directly with Tidal's official API for search and lossless FLAC playback.
-Handles automatic OAuth token refresh without requiring external microservices.
+"""
+Tidal provider: OAuth token management, search scoring, and FLAC/Hi-Res stream resolution.
+Handles BTS (progressive) and DASH manifests. Patches fMP4 init segments for ExoPlayer
+because Tidal encodes sampleRate=0 in the fLaC box header for Hi-Res tracks.
 """
 import asyncio
 import base64
 import json
 import logging
-import os
+import re
+from collections import OrderedDict
 from pathlib import Path
 import httpx
 from app.providers.base import MusicProvider
@@ -17,6 +18,29 @@ logger = logging.getLogger("bitchord.tidal")
 TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 API_BASE = "https://api.tidal.com/v1"
 
+class _LRUCache:
+    """Fixed-capacity LRU dict. Evicts least-recently-used entry when full."""
+    def __init__(self, maxsize: int = 256):
+        self._maxsize = maxsize
+        self._store: OrderedDict = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._store:
+            return default
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def __setitem__(self, key, value):
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = value
+        if len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+
+    def __contains__(self, key):
+        return key in self._store
+
+
 class TidalProvider(MusicProvider):
     def __init__(self, token_file: str = "token.json", country_code: str = "ID", public_host: str = ""):
         self.token_file = Path(token_file)
@@ -25,9 +49,10 @@ class TidalProvider(MusicProvider):
         self.public_host = public_host.rstrip("/") if public_host else ""
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
-        self.dash_cache: dict[str, str] = {}
-        self.init_url_cache: dict[str, str] = {}
-        self.init_segment_cache: dict[str, bytes] = {}
+        # Capped at 256 entries each to prevent unbounded RAM growth on long-running containers
+        self.dash_cache: _LRUCache = _LRUCache(maxsize=256)
+        self.init_url_cache: _LRUCache = _LRUCache(maxsize=256)
+        self.init_segment_cache: _LRUCache = _LRUCache(maxsize=256)
         self._load_token()
 
     @property
@@ -47,7 +72,6 @@ class TidalProvider(MusicProvider):
             self.token_data = None
 
     def is_configured(self) -> bool:
-        """Check if Tidal OAuth credentials are present."""
         if not self.token_data:
             self._load_token()
         return bool(self.token_data and self.token_data.get("access_token"))
@@ -162,11 +186,6 @@ class TidalProvider(MusicProvider):
             if not items:
                 return []
 
-            # Smart relevance scoring:
-            # 1. Demote karaoke, covers, tributes, instrumentals, speed up/slowed versions (unless requested)
-            # 2. Boost exact and partial title matches
-            # 3. Boost artist name matches and multi-token title+artist queries
-            # 4. Factor in popularity so original studio hits rank #1
             query_lower = clean_query.lower()
             query_words = [w for w in query_lower.split() if len(w) > 1]
 
@@ -188,7 +207,7 @@ class TidalProvider(MusicProvider):
                 t_artist = item.get("artist", {}).get("name", "").strip().lower()
                 popularity = int(item.get("popularity", 0) or 0)
 
-                # Demote junk unless explicitly requested in query
+                # Demote junk unless the query itself requests it (e.g. user searches "slowed")
                 is_junk = any(
                     k in full_title or k in t_artist
                     for k in junk_keywords
@@ -197,7 +216,6 @@ class TidalProvider(MusicProvider):
 
                 score = 300 if is_junk else 0
 
-                # Title relevance
                 if t_title == query_lower or full_title == query_lower:
                     score -= 600
                 elif full_title.startswith(query_lower):
@@ -208,24 +226,21 @@ class TidalProvider(MusicProvider):
                     matched_title_words = sum(1 for w in query_words if w in t_title)
                     score -= 150 * matched_title_words
                 else:
-                    # Title has no overlap with query (e.g. artist match only)
                     score += 400
 
-                # Artist relevance
                 if t_artist == query_lower or query_lower in t_artist:
                     score -= 300
                 elif query_words and any(w in t_artist for w in query_words):
                     matched_artist_words = sum(1 for w in query_words if w in t_artist)
                     score -= 100 * matched_artist_words
 
-                # Multi-token synergy (query contains words matching both title and artist)
+                # Synergy bonus when query words hit both title and artist
                 if len(query_words) >= 2:
                     has_title_match = any(w in t_title for w in query_words)
                     has_artist_match = any(w in t_artist for w in query_words)
                     if has_title_match and has_artist_match:
                         score -= 400
 
-                # Studio release priority over soundtrack/compilation
                 t_album = item.get("album", {}).get("title", "").strip().lower()
                 tags = item.get("mediaMetadata", {}).get("tags", [])
                 is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
@@ -234,7 +249,6 @@ class TidalProvider(MusicProvider):
                 if "soundtrack" in t_album or "compilation" in t_album:
                     score += 250
 
-                # Popularity as secondary tiebreaker (subtract up to 100 points)
                 score -= min(popularity, 100)
                 scored_items.append((score, idx, item))
 
@@ -324,9 +338,8 @@ class TidalProvider(MusicProvider):
             logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
             return None
 
-        # Studio Master Upgrade for Soundtracks/Compilations:
-        # If Tidal only provides 320k AAC (HIGH) for this specific rendition (e.g. movie soundtracks),
-        # look for the official studio album master with Hi-Res/Lossless by the EXACT same artist.
+        # When Tidal returns only 320k AAC (HIGH) for a given track rendition (e.g. movie soundtracks),
+        # try to find the official studio album master with Hi-Res or Lossless by the same artist.
         if data.get("audioQuality") == "HIGH":
             try:
                 meta_url = f"{API_BASE}/tracks/{clean_id}"
@@ -346,18 +359,18 @@ class TidalProvider(MusicProvider):
                             cand_artist = cand.get("artist", "").strip().lower()
                             cand_duration = float(cand.get("duration", 0))
 
-                            # 1. Flexible artist match (handles collaborations e.g. "Post Malone, Swae Lee" vs "Post Malone")
+                            # Flexible artist match: handles "Post Malone, Swae Lee" vs "Post Malone"
                             c_art = cand_artist.lower()
                             o_art = artist_name.lower()
                             if c_art != o_art and c_art not in o_art and o_art not in c_art:
                                 continue
-                            # 2. Clean base title match (handles radio edits / album versions)
-                            import re
+
+                            # Strip parenthetical suffixes before comparing titles
                             orig_base = re.sub(r'\(.*?\)|\[.*?\]', '', track_title).strip().lower()
                             cand_base = re.sub(r'\(.*?\)|\[.*?\]', '', cand_title).strip().lower()
                             if cand_base != orig_base:
                                 continue
-                            # 3. Reject covers, remixes, instrumentals, live versions (unless requested in original track)
+
                             orig_lower = (track_title + " " + artist_name).lower()
                             is_excluded = False
                             for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic", "live"):
@@ -366,10 +379,9 @@ class TidalProvider(MusicProvider):
                                     break
                             if is_excluded:
                                 continue
-                            # 4. Smart duration tolerance:
-                            # For standard studio tracks (e.g. 21 Guns, Everlong), up to 45s tolerance accommodates spoken intros / extended fades.
-                            # For tempo-modified variations (slowed, sped up, remix, nightcore, lofi), duration difference must be <= 5.0 seconds
-                            # because BitChord's VersionAudioAligner fails waveform correlation when tempo/duration diverges.
+
+                            # 45s tolerance for studio tracks; 5s for tempo-modified variants.
+                            # BitChord's VersionAudioAligner rejects waveform correlation beyond ~5s drift.
                             is_tempo_variant = any(k in orig_lower for k in ("slowed", "speed up", "sped up", "remix", "nightcore", "lofi"))
                             max_diff = 5.0 if is_tempo_variant else 45.0
                             if orig_duration > 0 and abs(cand_duration - orig_duration) > max_diff:
@@ -393,7 +405,6 @@ class TidalProvider(MusicProvider):
             bit_depth = raw_depth or 16
             sample_rate = raw_rate or 44100
 
-            # Direct progressive stream (BTS payload)
             if "bts" in mime and raw_manifest:
                 try:
                     decoded = json.loads(base64.b64decode(raw_manifest).decode("utf-8"))
@@ -428,15 +439,14 @@ class TidalProvider(MusicProvider):
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
 
-            # Tidal DASH manifest payload: serve via proper HTTP endpoint with patched init segment
             if "dash" in mime and raw_manifest:
                 try:
                     decoded_xml = base64.b64decode(raw_manifest).decode("utf-8")
                     effective_host = (public_host or self.public_host).rstrip("/")
 
-                    # Intercept and rewrite initialization segment to our patched endpoint
-                    # so ExoPlayer's FragmentedMp4Extractor does not fail on sampleRate=0
-                    import re
+                    # Rewrite the initialization segment URL to our patched endpoint.
+                    # Tidal's fLaC box in fMP4 DASH init segments encodes sampleRate=0,
+                    # which crashes ExoPlayer's FragmentedMp4Extractor before audio starts.
                     init_match = re.search(r'initialization="([^"]+)"', decoded_xml)
                     if init_match:
                         orig_init_url = init_match.group(1)
@@ -453,8 +463,7 @@ class TidalProvider(MusicProvider):
                     logger.error(f"Failed to decode DASH XML: {e}")
                     return None
 
-                # Extract exact bandwidth from MPD XML Representation tag (e.g. bandwidth="5057582")
-                import re
+                # Extract exact bandwidth from MPD Representation tag for accurate bitrate reporting
                 bw_match = re.search(r'bandwidth="(\d+)"', decoded_xml)
                 if bw_match:
                     calc_bitrate = max(int(bw_match.group(1)) // 1000, 1411)

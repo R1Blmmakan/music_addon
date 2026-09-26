@@ -1,4 +1,5 @@
-﻿import logging
+import logging
+import time
 import httpx
 from typing import AsyncGenerator
 from app.providers.base import MusicProvider
@@ -9,6 +10,9 @@ from app.crypto.deezer_cipher import (
 )
 
 logger = logging.getLogger("bitchord.deezer")
+
+# Deezer license_token TTL is roughly 3 hours in practice; re-auth every 23h is conservative but safe
+_SESSION_TTL_SECONDS = 23 * 3600
 
 class DeezerProvider(MusicProvider):
     def __init__(self, arl: str, public_host: str):
@@ -24,6 +28,7 @@ class DeezerProvider(MusicProvider):
         )
         self._api_token: str | None = None
         self._license_token: str | None = None
+        self._session_initialized_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -31,6 +36,11 @@ class DeezerProvider(MusicProvider):
 
     def is_configured(self) -> bool:
         return bool(self.arl and len(self.arl) >= 64)
+
+    def _session_is_stale(self) -> bool:
+        if not self._api_token or not self._license_token:
+            return True
+        return (time.monotonic() - self._session_initialized_at) >= _SESSION_TTL_SECONDS
 
     async def _init_session(self) -> bool:
         """Authenticate with Deezer gateway using ARL cookie."""
@@ -53,6 +63,7 @@ class DeezerProvider(MusicProvider):
 
             user_id = user.get("USER_ID", 0)
             if user_id and user_id != 0:
+                self._session_initialized_at = time.monotonic()
                 logger.info(f"Deezer authenticated as user ID {user_id}")
                 return True
 
@@ -62,12 +73,16 @@ class DeezerProvider(MusicProvider):
             logger.error(f"Error during Deezer session initialization: {exc}")
             return False
 
+    async def _ensure_session(self) -> bool:
+        """Re-authenticate if the session is missing or older than _SESSION_TTL_SECONDS."""
+        if self._session_is_stale():
+            return await self._init_session()
+        return True
+
     async def health(self) -> bool:
         if not self.is_configured():
             return False
-        if not self._api_token:
-            return await self._init_session()
-        return True
+        return await self._ensure_session()
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
         """Search Deezer public catalogue without requiring authenticated session."""
@@ -103,10 +118,8 @@ class DeezerProvider(MusicProvider):
 
     async def get_track_data(self, track_id: str) -> dict | None:
         """Fetch internal song details from Deezer gateway."""
-        if not self._api_token:
-            ready = await self._init_session()
-            if not ready:
-                return None
+        if not await self._ensure_session():
+            return None
 
         url = f"https://www.deezer.com/ajax/gw-light.php?method=song.getData&api_version=1.0&api_token={self._api_token}"
         cookies = {"arl": self.arl}
@@ -129,6 +142,7 @@ class DeezerProvider(MusicProvider):
             return None, "flac"
 
         url = "https://media.deezer.com/v1/get_url"
+        # Always request FLAC first; MP3 fallback only if Deezer has no FLAC for this track
         requested_formats = [
             {"cipher": "BF_CBC_STRIPE", "format": "FLAC"},
             {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"},
@@ -170,13 +184,18 @@ class DeezerProvider(MusicProvider):
         if not cdn_url:
             return None
 
+        # Reject non-FLAC when caller expects lossless; BitChord will fall back to YouTube otherwise
         is_flac = audio_format == "flac"
+        if not is_flac and quality == "lossless":
+            logger.info(f"Deezer track {clean_id} has no FLAC; returning None to trigger provider fallback")
+            return None
+
         return {
             "url": f"{self.public_host}/audio/dz/{clean_id}",
             "format": "flac" if is_flac else "mp3",
             "codec": "flac" if is_flac else "mp3",
             "container": "flac" if is_flac else "mp3",
-            "bitDepth": 16 if is_flac else 16,
+            "bitDepth": 16,
             "sampleRate": 44100,
             "bitrate": 1411 if is_flac else 320,
         }
@@ -216,7 +235,7 @@ class DeezerProvider(MusicProvider):
                     block = bytes(buffer[:CHUNK_SIZE])
                     del buffer[:CHUNK_SIZE]
 
-                    # Every third 2048-byte chunk in Deezer's stripe scheme is encrypted
+                    # Every third 2048-byte stripe in Deezer's encryption scheme is Blowfish-CBC encrypted
                     if chunk_idx % 3 == 0:
                         decrypted = decrypt_stripe_chunk(block, key)
                         yield decrypted
@@ -224,7 +243,7 @@ class DeezerProvider(MusicProvider):
                         yield block
                     chunk_idx += 1
 
-            # Yield remaining non-2048 trailing bytes without modification
+            # Trailing bytes shorter than CHUNK_SIZE are always plaintext
             if buffer:
                 yield bytes(buffer)
 
