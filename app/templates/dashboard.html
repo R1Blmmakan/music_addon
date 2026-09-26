@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BitChord Lossless Addon</title>
+  <style>
+    :root {
+      --bg: #090b10;
+      --surface: #121620;
+      --border: #1e2433;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --yellow: #eab308;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      padding: 2.5rem 1.5rem;
+      display: flex;
+      justify-content: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 760px;
+    }
+    header {
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      font-weight: 600;
+      margin-bottom: 0.75rem;
+    }
+    .badge-online {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--green);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.4rem;
+    }
+    .desc {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    @media (max-width: 600px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+    }
+    .card h2 {
+      font-size: 1.05rem;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .dot-active { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot-idle { background: var(--yellow); }
+    .card p {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .endpoint-list {
+      list-style: none;
+      margin-top: 1rem;
+    }
+    .endpoint-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.85rem;
+    }
+    .endpoint-item:last-child { border-bottom: none; }
+    .method {
+      background: #1f293d;
+      color: #7dd3fc;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.75rem;
+      margin-right: 0.5rem;
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+    .callout {
+      background: #0f172a;
+      border-left: 3px solid var(--accent);
+      padding: 1rem;
+      border-radius: 0 6px 6px 0;
+      font-size: 0.85rem;
+      margin-top: 1.5rem;
+    }
+    code {
+      background: #1a2234;
+      padding: 0.15rem 0.35rem;
+      border-radius: 3px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="badge badge-online">Relay Operational</span>
+      <h1>BitChord Lossless Addon</h1>
+      <p class="desc">Self-hosted high-resolution audio proxy and multi-provider fallback engine.</p>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Deezer Provider <span class="status-dot {{dz_status_class}}"></span></h2>
+        <p>16-bit 44.1kHz FLAC streams with real-time Blowfish CBC chunk decryption and HTTP 206 partial content support.</p>
+        <p style="margin-top:0.5rem; font-weight:600; color:{{dz_color}};">{{dz_status_text}}</p>
+      </div>
+
+      <div class="card">
+        <h2>Tidal Provider <span class="status-dot {{td_status_class}}"></span></h2>
+        <p>24-bit Hi-Res FLAC, Dolby Atmos, and MPEG-DASH manifest resolution via upstream hifi-api instance.</p>
+        <p style="margin-top:0.5rem; font-weight:600; color:{{td_color}};">{{td_status_text}}</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Active Protocol Endpoints</h2>
+      <ul class="endpoint-list">
+        <li class="endpoint-item">
+          <div><span class="method">GET</span> <code>/manifest.json</code></div>
+          <div><a href="/manifest.json">Inspect Handshake</a></div>
+        </li>
+        <li class="endpoint-item">
+          <div><span class="method">GET</span> <code>/search?q={query}</code></div>
+          <div><a href="/search?q=Daft+Punk">Sample Query</a></div>
+        </li>
+        <li class="endpoint-item">
+          <div><span class="method">GET</span> <code>/health</code></div>
+          <div><a href="/health">JSON Diagnostics</a></div>
+        </li>
+        <li class="endpoint-item">
+          <div><span class="method">GET</span> <code>/docs</code></div>
+          <div><a href="/docs">OpenAPI Documentation</a></div>
+        </li>
+      </ul>
+    </div>
+
+    <div class="callout">
+      <strong>BitChord Client Setup:</strong> In the BitChord Android application, navigate to <code>Settings &gt; Sources &gt; Add Source</code> and enter your public HTTPS URL.
+    </div>
+  </div>
+</body>
+</html>
