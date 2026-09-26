@@ -107,7 +107,12 @@ class TidalProvider(MusicProvider):
                 refreshed = await self._refresh_access_token()
                 if refreshed:
                     resp = await self.client.get(url, headers=self._auth_headers())
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                cc = resp.json().get("countryCode")
+                if cc:
+                    self.country_code = cc
+                return True
+            return False
         except Exception:
             return False
 
