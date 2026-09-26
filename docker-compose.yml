@@ -1,33 +1,24 @@
-services:
+﻿services:
   unified-addon:
     build: .
     container_name: bitchord-unified-addon
     restart: unless-stopped
     ports:
       - "8100:8000"
+    volumes:
+      - ./token.json:/app/token.json:ro
     environment:
       - PORT=8000
       # Public URL where BitChord will access this service (HTTPS required for Android)
       - PUBLIC_HOST=${PUBLIC_HOST:-https://addon.yourdomain.com}
       # Secret key protecting your endpoints from crawlers and bots
       - ACCESS_TOKEN=${ACCESS_TOKEN:-}
-      # Your Deezer ARL token (64 hexadecimal characters)
+      # Your Deezer ARL token (64 hexadecimal characters from browser cookies)
       - DEEZER_ARL=${DEEZER_ARL:-}
-      # Optional: point to local Tidal hifi-api instance if running
-      - TIDAL_API_URL=${TIDAL_API_URL:-}
-      - PREFERRED_PROVIDER=deezer
-      - ENABLE_FALLBACK=false
-
-  # Upstream Tidal API engine (optional: uncomment when hifi-api is cloned)
-  # tidal-backend:
-  #   image: python:3.11-slim
-  #   container_name: tidal-backend
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8180:8080"
-  #   volumes:
-  #     - ./hifi-api:/app
-  #   working_dir: /app
-  #   command: sh -c "pip install --no-cache-dir -r requirements.txt && python main.py"
-  #   environment:
-  #     - PORT=8080
+      # Native Tidal settings (credentials generated via: python app/auth_tidal.py)
+      - TIDAL_TOKEN_FILE=/app/token.json
+      - TIDAL_COUNTRY_CODE=${TIDAL_COUNTRY_CODE:-US}
+      # Priority: "tidal" or "deezer"
+      - PREFERRED_PROVIDER=${PREFERRED_PROVIDER:-tidal}
+      # Automatic cross-provider fallback if track is missing or fails on primary
+      - ENABLE_FALLBACK=${ENABLE_FALLBACK:-true}

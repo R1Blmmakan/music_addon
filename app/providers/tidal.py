@@ -1,47 +1,143 @@
+﻿"""
+Native Tidal Music Provider
+Communicates directly with Tidal's official API for search and lossless FLAC playback.
+Handles automatic OAuth token refresh without requiring external microservices.
+"""
+import asyncio
 import base64
 import json
 import logging
+import os
+from pathlib import Path
 import httpx
 from app.providers.base import MusicProvider
 
 logger = logging.getLogger("bitchord.tidal")
 
+TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
+API_BASE = "https://api.tidal.com/v1"
+
 class TidalProvider(MusicProvider):
-    def __init__(self, api_url: str):
-        self.base_url = api_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=10.0)
+    def __init__(self, token_file: str = "token.json", country_code: str = "US"):
+        self.token_file = Path(token_file)
+        self.country_code = country_code or "US"
+        self.client = httpx.AsyncClient(timeout=15.0)
+        self.token_data: dict | None = None
+        self._load_token()
 
     @property
     def name(self) -> str:
         return "tidal"
 
+    def _load_token(self):
+        """Load stored OAuth token from local disk."""
+        if self.token_file.exists():
+            try:
+                with open(self.token_file, "r", encoding="utf-8") as f:
+                    self.token_data = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read Tidal token file {self.token_file}: {e}")
+                self.token_data = None
+        else:
+            self.token_data = None
+
     def is_configured(self) -> bool:
-        return bool(self.base_url and self.base_url.startswith("http"))
+        """Check if Tidal OAuth credentials are present."""
+        if not self.token_data:
+            self._load_token()
+        return bool(self.token_data and self.token_data.get("access_token"))
+
+    async def _refresh_access_token(self) -> bool:
+        """Refresh expired access token using stored refresh token."""
+        if not self.token_data or not self.token_data.get("refresh_token"):
+            return False
+
+        client_id = self.token_data.get("client_id", "fX2JxdmntZWK0ixT")
+        client_secret = self.token_data.get("client_secret", "1Nm5AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=")
+        refresh_token = self.token_data["refresh_token"]
+
+        data = {
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+            "scope": "r_usr+w_usr+w_sub",
+        }
+        auth = (client_id, client_secret)
+
+        try:
+            resp = await self.client.post(TOKEN_URL, data=data, auth=auth)
+            if resp.status_code == 200:
+                new_info = resp.json()
+                self.token_data["access_token"] = new_info["access_token"]
+                if "refresh_token" in new_info:
+                    self.token_data["refresh_token"] = new_info["refresh_token"]
+
+                with open(self.token_file, "w", encoding="utf-8") as f:
+                    json.dump(self.token_data, f, indent=2)
+
+                logger.info("Successfully refreshed Tidal access token.")
+                return True
+            else:
+                logger.error(f"Tidal token refresh failed with HTTP {resp.status_code}: {resp.text}")
+                return False
+        except Exception as exc:
+            logger.error(f"Exception during Tidal token refresh: {exc}")
+            return False
+
+    def _auth_headers(self) -> dict:
+        access_token = self.token_data.get("access_token", "") if self.token_data else ""
+        return {
+            "authorization": f"Bearer {access_token}",
+            "User-Agent": "okhttp/5.3.2",
+            "Accept": "application/json",
+            "X-Platform": "android",
+            "X-Tidal-Platform": "android",
+        }
 
     async def health(self) -> bool:
+        """Verify Tidal API accessibility and token validity."""
         if not self.is_configured():
             return False
         try:
-            resp = await self.client.get(f"{self.base_url}/")
+            url = f"{API_BASE}/sessions"
+            resp = await self.client.get(url, headers=self._auth_headers())
+            if resp.status_code == 401:
+                refreshed = await self._refresh_access_token()
+                if refreshed:
+                    resp = await self.client.get(url, headers=self._auth_headers())
             return resp.status_code == 200
         except Exception:
             return False
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
-        """Search Tidal catalogue through upstream hifi-api instance."""
+        """Search Tidal catalogue for tracks."""
         if not self.is_configured():
             return []
 
+        clean_query = query.strip()
+        if not clean_query:
+            return []
+
+        url = f"{API_BASE}/search/tracks"
+        params = {
+            "query": clean_query,
+            "limit": limit,
+            "offset": 0,
+            "countryCode": self.country_code,
+        }
+
         try:
-            resp = await self.client.get(f"{self.base_url}/search/", params={"query": query})
-            if resp.status_code != 200:
-                resp = await self.client.get(f"{self.base_url}/search", params={"q": query})
+            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+            if resp.status_code == 401:
+                if await self._refresh_access_token():
+                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
             if resp.status_code != 200:
+                logger.error(f"Tidal search error ({resp.status_code}): {resp.text[:200]}")
                 return []
 
-            data = resp.json().get("data", {})
-            items = data.get("items", []) if isinstance(data, dict) else data
+            data = resp.json()
+            items = data.get("items", [])
 
             tracks = []
             for item in items[:limit]:
@@ -72,20 +168,32 @@ class TidalProvider(MusicProvider):
             return []
 
     async def get_stream(self, track_id: str, quality: str = "lossless") -> dict | None:
-        """Resolve Tidal track ID into direct signed CDN URL or DASH manifest."""
+        """Resolve track ID into signed FLAC CDN URL or DASH manifest."""
         if not self.is_configured():
             return None
 
         clean_id = track_id.replace("td:", "")
         wanted_quality = "HI_RES_LOSSLESS" if quality.lower() in ("lossless", "max", "hi-res") else "LOSSLESS"
 
+        url = f"{API_BASE}/tracks/{clean_id}/playbackinfopostpaywall"
+        params = {
+            "countryCode": self.country_code,
+            "audioquality": wanted_quality,
+            "playbackmode": "STREAM",
+            "assetpresentation": "FULL",
+        }
+
         try:
-            url = f"{self.base_url}/track/"
-            resp = await self.client.get(url, params={"id": clean_id, "quality": wanted_quality})
+            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+            if resp.status_code == 401:
+                if await self._refresh_access_token():
+                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+
             if resp.status_code != 200:
+                logger.error(f"Tidal playbackinfo failed for track {clean_id}: {resp.status_code} {resp.text[:200]}")
                 return None
 
-            data = resp.json().get("data", {})
+            data = resp.json()
             raw_manifest = data.get("manifest")
             mime = data.get("manifestMimeType", "")
             bit_depth = data.get("bitDepth", 16)
@@ -111,7 +219,6 @@ class TidalProvider(MusicProvider):
 
             # Tidal DASH manifest payload
             if "dash" in mime and raw_manifest:
-                # BitChord natively accepts DASH data URIs or direct URLs
                 manifest_data_uri = f"data:application/dash+xml;base64,{raw_manifest}"
                 return {
                     "url": manifest_data_uri,

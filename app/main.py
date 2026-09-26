@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger("bitchord.unified")
 
 deezer = DeezerProvider(settings.deezer_arl, settings.public_host)
-tidal = TidalProvider(settings.tidal_api_url)
+tidal = TidalProvider(settings.tidal_token_file, settings.tidal_country_code)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
         td_ok = await tidal.health()
         logger.info(f"Tidal status: {'Ready' if td_ok else 'Unreachable'}")
     else:
-        logger.info("Tidal API URL not set. Tidal provider disabled.")
+        logger.info("Tidal token.json not found. Run python app/auth_tidal.py to enable Tidal.")
     yield
 
 app = FastAPI(
@@ -101,7 +101,7 @@ async def dashboard():
     ).replace(
         "{{td_status_class}}", "dot-active" if td_configured else "dot-idle"
     ).replace(
-        "{{td_status_text}}", "Active & Connected" if td_configured else "Optional (hifi-api upstream idle)"
+        "{{td_status_text}}", "Active & Ready (HiFi/Lossless)" if td_configured else "Awaiting token.json (run python app/auth_tidal.py)"
     ).replace(
         "{{td_color}}", "#22c55e" if td_configured else "#8b949e"
     )
