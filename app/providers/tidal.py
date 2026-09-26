@@ -328,14 +328,23 @@ class TidalProvider(MusicProvider):
                             # 1. Exact artist match (strictly NO cover singers)
                             if cand_artist != artist_name.lower():
                                 continue
-                            # 2. Exact title match
-                            if cand_title != track_title.lower():
+                            # 2. Clean base title match (handles radio edits / album versions)
+                            import re
+                            orig_base = re.sub(r'\(.*?\)|\[.*?\]', '', track_title).strip().lower()
+                            cand_base = re.sub(r'\(.*?\)|\[.*?\]', '', cand_title).strip().lower()
+                            if cand_base != orig_base:
                                 continue
-                            # 3. Reject covers, remixes, instrumentals, speed up
-                            if any(bad in cand_title for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic")):
+                            # 3. Reject covers, remixes, instrumentals, live versions (unless requested)
+                            orig_lower = track_title.lower()
+                            is_excluded = False
+                            for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic", "live"):
+                                if bad in cand_title and bad not in orig_lower:
+                                    is_excluded = True
+                                    break
+                            if is_excluded:
                                 continue
-                            # 4. Strict duration matching within 2.5 seconds
-                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 2.5:
+                            # 4. Generous duration tolerance (up to 45s) for album intros, spoken lyrics, outro fades
+                            if orig_duration > 0 and abs(cand_duration - orig_duration) > 45.0:
                                 continue
 
                             if cand_id != clean_id:
