@@ -53,7 +53,7 @@ async def security_token_middleware(request: Request, call_next):
     path = request.url.path
 
     # Public diagnostic routes
-    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/"):
+    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/") or path.startswith("/diag/"):
         return await call_next(request)
 
     # If no ACCESS_TOKEN is set in .env, run in open mode
@@ -161,13 +161,17 @@ async def search(q: str, quality: str = "lossless"):
     return {"tracks": combined}
 
 @app.get("/stream/{item_id}")
-async def resolve_stream(item_id: str, quality: str = "lossless"):
+async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     # Enforce strictly lossless FLAC: ignore any low or 96k request
     quality = "lossless"
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+    dynamic_host = f"{proto}://{host}".rstrip("/")
+
     # Handle Tidal items
     if item_id.startswith("td:"):
-        res = await tidal.get_stream(item_id, quality)
+        res = await tidal.get_stream(item_id, quality, public_host=dynamic_host)
         if res and res.get("url"):
             return res
 
@@ -200,6 +204,44 @@ async def resolve_stream(item_id: str, quality: str = "lossless"):
         status_code=404,
         content={"error": f"Track {item_id} could not be resolved by configured providers."}
     )
+
+@app.get("/diag/td/{track_id}")
+async def diag_tidal(track_id: str):
+    """Diagnostic endpoint to inspect raw Tidal manifest data."""
+    clean_id = track_id.replace("td:", "").replace(".mpd", "")
+    out = {}
+    for q in ("HI_RES_LOSSLESS", "LOSSLESS", "HIGH"):
+        url = f"https://api.tidal.com/v1/tracks/{clean_id}/playbackinfopostpaywall"
+        params = {
+            "countryCode": tidal.country_code,
+            "audioquality": q,
+            "playbackmode": "STREAM",
+            "assetpresentation": "FULL",
+        }
+        try:
+            resp = await tidal.client.get(url, headers=tidal._auth_headers(), params=params)
+            if resp.status_code == 200:
+                d = resp.json()
+                raw_m = d.get("manifest", "")
+                mime = d.get("manifestMimeType", "")
+                decoded = ""
+                try:
+                    decoded = base64.b64decode(raw_m).decode("utf-8")
+                except Exception as e:
+                    decoded = f"decode error: {e}"
+                out[q] = {
+                    "status": 200,
+                    "mime": mime,
+                    "bitDepth": d.get("bitDepth"),
+                    "sampleRate": d.get("sampleRate"),
+                    "audioQuality": d.get("audioQuality"),
+                    "manifest_preview": decoded[:600] if decoded else "",
+                }
+            else:
+                out[q] = {"status": resp.status_code, "text": resp.text[:200]}
+        except Exception as exc:
+            out[q] = {"error": str(exc)}
+    return out
 
 @app.get("/dash/td/{track_id}")
 async def serve_dash_manifest(track_id: str):

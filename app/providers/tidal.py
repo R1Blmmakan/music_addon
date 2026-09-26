@@ -163,6 +163,7 @@ class TidalProvider(MusicProvider):
                     "artist": item.get("artist", {}).get("name", ""),
                     "album": item.get("album", {}).get("title", ""),
                     "duration": float(item.get("duration", 0)),
+                    "artwork": artwork,
                     "artworkURL": artwork,
                     "format": "flac",
                     "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else "LOSSLESS",
@@ -175,14 +176,14 @@ class TidalProvider(MusicProvider):
             logger.error(f"Tidal search failed for '{query}': {exc}")
             return []
 
-    async def get_stream(self, track_id: str, quality: str = "lossless") -> dict | None:
+    async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
         """Resolve track ID into signed FLAC CDN URL or DASH manifest."""
         if not self.is_configured():
             return None
 
         clean_id = track_id.replace("td:", "")
-        # Prioritize direct single-file FLAC (BTS) over multi-segment DASH for bulletproof ExoPlayer playback
-        qualities_to_try = ["LOSSLESS", "HI_RES_LOSSLESS", "HIGH"]
+        # Prioritize Hi-Res Lossless (24-bit) then standard Lossless (16-bit FLAC)
+        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
 
         data = None
         for q in qualities_to_try:
@@ -224,11 +225,15 @@ class TidalProvider(MusicProvider):
                     decoded = json.loads(base64.b64decode(raw_manifest).decode("utf-8"))
                     direct_urls = decoded.get("urls", [])
                     if direct_urls:
+                        url = direct_urls[0]
+                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime.lower()
                         return {
-                            "url": direct_urls[0],
+                            "url": url,
                             "format": "flac",
                             "codec": "flac",
-                            "container": "flac",
+                            "container": "mp4" if is_mp4 else "flac",
+                            "manifest": "none",
+                            "encrypted": False,
                             "bitDepth": bit_depth,
                             "sampleRate": sample_rate,
                             "bitrate": 1411 if bit_depth == 16 else 3000,
@@ -244,15 +249,18 @@ class TidalProvider(MusicProvider):
                 except Exception as e:
                     logger.error(f"Failed to decode DASH XML: {e}")
 
-                manifest_url = f"{self.public_host}/dash/td/{clean_id}.mpd" if self.public_host else f"/dash/td/{clean_id}.mpd"
+                effective_host = (public_host or self.public_host).rstrip("/")
+                manifest_url = f"{effective_host}/dash/td/{clean_id}.mpd" if effective_host else f"/dash/td/{clean_id}.mpd"
                 return {
                     "url": manifest_url,
-                    "format": "dash",
+                    "format": "flac",
                     "codec": "flac",
-                    "container": "dash",
+                    "container": "fmp4",
+                    "manifest": "dash",
+                    "encrypted": False,
                     "bitDepth": bit_depth,
                     "sampleRate": sample_rate,
-                    "bitrate": 2000,
+                    "bitrate": 3000 if bit_depth == 24 else 1411,
                 }
 
             return None
