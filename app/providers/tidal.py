@@ -369,10 +369,19 @@ class TidalProvider(MusicProvider):
                         mime_str = decoded.get("mimeType", "").lower()
                         audio_q = data.get("audioQuality", "").upper()
 
+                        # Lossy codecs that Tidal sometimes serves under LOSSLESS tier
+                        # for rights-restricted tracks. Must be rejected explicitly.
+                        LOSSY_CODECS = ("opus", "mp4a", "aac", "mp3", "he-aac")
+                        has_lossy = any(c in codecs_str for c in LOSSY_CODECS)
+
                         is_actual_flac = (
-                            "flac" in codecs_str
-                            or "flac" in mime_str
-                            or ("mp4a" not in codecs_str and audio_q in ("LOSSLESS", "HI_RES_LOSSLESS"))
+                            not has_lossy
+                            and (
+                                "flac" in codecs_str
+                                or "flac" in mime_str
+                                # codecs field absent: trust audioQuality tier
+                                or (not codecs_str and audio_q in ("LOSSLESS", "HI_RES_LOSSLESS"))
+                            )
                         )
                         if not is_actual_flac:
                             logger.info(f"Tidal track {clean_id} is only available in lossy ({codecs_str}). Rejecting per FLAC-only rule.")

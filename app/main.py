@@ -183,9 +183,14 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
     dynamic_host = f"{proto}://{host}".rstrip("/")
 
+    # BitChord sends title/artist as query params for the stream endpoint.
+    # These are used as hints if Tidal metadata fetch fails (e.g. regional tracks).
+    hint_title = request.query_params.get("title", "").strip()
+    hint_artist = request.query_params.get("artist", "").strip()
+
     try:
         result = await asyncio.wait_for(
-            _resolve_stream_inner(item_id, quality, dynamic_host),
+            _resolve_stream_inner(item_id, quality, dynamic_host, hint_title, hint_artist),
             timeout=7.0
         )
         return result
@@ -196,7 +201,13 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
             content={"error": f"Track {item_id} resolution timed out. Falling back to YouTube Music."}
         )
 
-async def _resolve_stream_inner(item_id: str, quality: str, dynamic_host: str):
+async def _resolve_stream_inner(
+    item_id: str,
+    quality: str,
+    dynamic_host: str,
+    hint_title: str = "",
+    hint_artist: str = "",
+):
     """Inner resolution logic, wrapped by resolve_stream with a hard 7s timeout."""
     if item_id.startswith("td:"):
         # Pre-launch Deezer fallback concurrently with tidal.get_stream().
@@ -208,7 +219,7 @@ async def _resolve_stream_inner(item_id: str, quality: str, dynamic_host: str):
         deezer_prefetch = None
         if settings.enable_fallback and deezer.is_configured():
             deezer_prefetch = asyncio.create_task(
-                _tidal_to_deezer_fallback(item_id, quality)
+                _tidal_to_deezer_fallback(item_id, quality, hint_title, hint_artist)
             )
 
         res = await tidal_task
@@ -249,36 +260,50 @@ async def _resolve_stream_inner(item_id: str, quality: str, dynamic_host: str):
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
-async def _tidal_to_deezer_fallback(item_id: str, quality: str) -> dict | None:
-    """Fetch track title+artist from Tidal, then search Deezer by name for cross-provider fallback.
+async def _tidal_to_deezer_fallback(
+    item_id: str,
+    quality: str,
+    hint_title: str = "",
+    hint_artist: str = "",
+) -> dict | None:
+    """Search Deezer by track title+artist for a Tidal track that failed to resolve.
 
-    Searching by the raw numeric ID would match random Deezer tracks, causing wrong-song playback.
+    Title/artist are fetched from Tidal metadata first. If the track does not exist
+    in Tidal (e.g. regional tracks), hint_title/hint_artist from the search index
+    are used as a fallback query so Deezer still gets a chance to serve the track.
     """
     from app.providers.tidal import API_BASE
     clean_id = item_id.replace("td:", "")
+    query = ""
     try:
         meta_resp = await tidal.client.get(
             f"{API_BASE}/tracks/{clean_id}",
             headers=tidal._auth_headers(),
             params={"countryCode": tidal.country_code}
         )
-        if meta_resp.status_code != 200:
-            return None
-        meta = meta_resp.json()
-        title = meta.get("title", "").strip()
-        artist = meta.get("artist", {}).get("name", "").strip()
-        if not title or not artist:
-            return None
-        query = f"{title} {artist}"
+        if meta_resp.status_code == 200:
+            meta = meta_resp.json()
+            title = meta.get("title", "").strip()
+            artist = meta.get("artist", {}).get("name", "").strip()
+            if title and artist:
+                query = f"{title} {artist}"
     except Exception as exc:
         logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
-        return None
+
+    # Tidal 404 or missing metadata: use hints passed from search index if available
+    if not query:
+        if hint_title and hint_artist:
+            query = f"{hint_title} {hint_artist}"
+            logger.info(f"Tidal metadata unavailable for {clean_id}; using search hint: {query!r}")
+        else:
+            logger.warning(f"No query available for Deezer fallback on {clean_id}")
+            return None
 
     dz_matches = await deezer.search(query, limit=1)
     for match in dz_matches:
         stream = await deezer.get_stream(match["id"], quality)
         if stream and stream.get("url"):
-            logger.info(f"Deezer fallback resolved '{query}' to {match['id']}")
+            logger.info(f"Deezer fallback resolved {query!r} to {match['id']}")
             return stream
     return None
 
