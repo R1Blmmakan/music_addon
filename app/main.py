@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BitChord Unified Lossless Addon",
-    version="1.0.0",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -199,13 +199,27 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
 async def _resolve_stream_inner(item_id: str, quality: str, dynamic_host: str):
     """Inner resolution logic, wrapped by resolve_stream with a hard 7s timeout."""
     if item_id.startswith("td:"):
-        res = await tidal.get_stream(item_id, quality, public_host=dynamic_host)
+        # Pre-launch Deezer fallback concurrently with tidal.get_stream().
+        # Tidal now returns None fast for HIGH-only tracks, so Deezer result
+        # is typically ready the moment Tidal fails — zero extra latency.
+        tidal_task = asyncio.create_task(
+            tidal.get_stream(item_id, quality, public_host=dynamic_host)
+        )
+        deezer_prefetch = None
+        if settings.enable_fallback and deezer.is_configured():
+            deezer_prefetch = asyncio.create_task(
+                _tidal_to_deezer_fallback(item_id, quality)
+            )
+
+        res = await tidal_task
         if res and res.get("url"):
+            if deezer_prefetch:
+                deezer_prefetch.cancel()
             return res
 
-        if settings.enable_fallback and deezer.is_configured():
-            logger.info(f"Tidal track {item_id} failed; falling back to Deezer by title search")
-            fallback_stream = await _tidal_to_deezer_fallback(item_id, quality)
+        if deezer_prefetch:
+            logger.info(f"Tidal track {item_id} has no FLAC; awaiting parallel Deezer fallback")
+            fallback_stream = await deezer_prefetch
             if fallback_stream:
                 return fallback_stream
 
@@ -260,7 +274,7 @@ async def _tidal_to_deezer_fallback(item_id: str, quality: str) -> dict | None:
         logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
         return None
 
-    dz_matches = await deezer.search(query, limit=3)
+    dz_matches = await deezer.search(query, limit=1)
     for match in dz_matches:
         stream = await deezer.get_stream(match["id"], quality)
         if stream and stream.get("url"):

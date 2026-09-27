@@ -337,71 +337,19 @@ class TidalProvider(MusicProvider):
 
         clean_id = track_id.replace("td:", "")
         original_id = clean_id
-        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS", "HIGH"]
 
-        data = await self._fetch_playback_info(clean_id, qualities_to_try)
+        data = await self._fetch_playback_info(clean_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
         if not data:
             logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
             return None
 
-        # When Tidal returns only 320k AAC (HIGH) for a given track rendition (e.g. movie soundtracks),
-        # try to find the official studio album master with Hi-Res or Lossless by the same artist.
+        # Tidal returned only HIGH (AAC): no FLAC available for this track.
+        # Return None immediately so the caller's parallel Deezer pre-fetch delivers
+        # without waiting. The old studio-master search loop ran 3-5s here and routinely
+        # starved the Deezer fallback inside the 7s hard timeout.
         if data.get("audioQuality") == "HIGH":
-            try:
-                meta_url = f"{API_BASE}/tracks/{clean_id}"
-                meta_resp = await self.client.get(meta_url, headers=self._auth_headers(), params={"countryCode": self.country_code})
-                if meta_resp.status_code == 200:
-                    meta = meta_resp.json()
-                    track_title = meta.get("title", "").strip()
-                    artist_name = meta.get("artist", {}).get("name", "").strip()
-                    orig_duration = float(meta.get("duration", 0))
-
-                    if track_title and artist_name:
-                        lookup_query = f"{track_title} {artist_name}".strip()
-                        candidates = await self.search(lookup_query, limit=5)
-                        for cand in candidates:
-                            cand_id = cand["id"].replace("td:", "")
-                            cand_title = cand.get("title", "").strip().lower()
-                            cand_artist = cand.get("artist", "").strip().lower()
-                            cand_duration = float(cand.get("duration", 0))
-
-                            # Flexible artist match: handles "Post Malone, Swae Lee" vs "Post Malone"
-                            c_art = cand_artist.lower()
-                            o_art = artist_name.lower()
-                            if c_art != o_art and c_art not in o_art and o_art not in c_art:
-                                continue
-
-                            # Strip parenthetical suffixes before comparing titles
-                            orig_base = re.sub(r'\(.*?\)|\[.*?\]', '', track_title).strip().lower()
-                            cand_base = re.sub(r'\(.*?\)|\[.*?\]', '', cand_title).strip().lower()
-                            if cand_base != orig_base:
-                                continue
-
-                            orig_lower = (track_title + " " + artist_name).lower()
-                            is_excluded = False
-                            for bad in ("speed up", "slowed", "remix", "instrumental", "karaoke", "tribute", "cover", "acoustic", "live"):
-                                if bad in cand_title and bad not in orig_lower:
-                                    is_excluded = True
-                                    break
-                            if is_excluded:
-                                continue
-
-                            # 45s tolerance for studio tracks; 5s for tempo-modified variants.
-                            # BitChord's VersionAudioAligner rejects waveform correlation beyond ~5s drift.
-                            is_tempo_variant = any(k in orig_lower for k in ("slowed", "speed up", "sped up", "remix", "nightcore", "lofi"))
-                            max_diff = 5.0 if is_tempo_variant else 45.0
-                            if orig_duration > 0 and abs(cand_duration - orig_duration) > max_diff:
-                                continue
-
-                            if cand_id != clean_id:
-                                cand_data = await self._fetch_playback_info(cand_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
-                                if cand_data and cand_data.get("audioQuality") in ("HI_RES_LOSSLESS", "LOSSLESS"):
-                                    logger.info(f"Resolved track {clean_id} (HIGH) to studio master {cand_id} ({cand_data.get('audioQuality')}) by {artist_name}")
-                                    clean_id = cand_id
-                                    data = cand_data
-                                    break
-            except Exception as upgrade_err:
-                logger.warning(f"Studio master lookup failed for track {clean_id}: {upgrade_err}")
+            logger.info(f"Tidal track {clean_id} has no FLAC (HIGH only) — delegating to Deezer")
+            return None
 
         try:
             raw_manifest = data.get("manifest")
