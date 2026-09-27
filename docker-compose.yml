@@ -7,6 +7,7 @@
       - "8100:8000"
     volumes:
       - ./token.json:/app/token.json
+      - ./app:/app/app
     environment:
       - PORT=8000
       # Public URL where BitChord will access this service (HTTPS required for Android)

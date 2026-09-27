@@ -216,6 +216,13 @@ class TidalProvider(MusicProvider):
 
                 score = 300 if is_junk else 0
 
+                # Demote versions/remixes unless user specifically queried for them
+                query_wants_version = any(v in query_lower for v in ("remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"))
+                if t_version and not query_wants_version:
+                    score += 350
+                elif not t_version and not query_wants_version:
+                    score -= 200  # Bonus for canonical album track
+
                 if t_title == query_lower or full_title == query_lower:
                     score -= 600
                 elif full_title.startswith(query_lower):
