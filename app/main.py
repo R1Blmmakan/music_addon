@@ -236,23 +236,15 @@ async def _resolve_stream_inner(
                 return fallback_stream
 
     if item_id.startswith("dz:"):
-        # Run Deezer CDN resolution and Tidal fallback pre-fetch in parallel.
-        # Tidal search starts immediately so fallback is ready the moment Deezer fails,
-        # instead of adding a full extra Tidal round-trip after Deezer confirms failure.
-        deezer_task = asyncio.create_task(deezer.get_stream(item_id, quality))
-        tidal_prefetch = None
-        if settings.enable_fallback and tidal.is_configured():
-            tidal_prefetch = asyncio.create_task(_deezer_to_tidal_fallback(item_id, quality, dynamic_host))
-
-        res = await deezer_task
+        # Deezer is the primary provider with near-100% FLAC availability.
+        # Resolve Deezer first; only invoke Tidal fallback if Deezer explicitly fails.
+        res = await deezer.get_stream(item_id, quality)
         if res and res.get("url"):
-            if tidal_prefetch:
-                tidal_prefetch.cancel()
             return res
 
-        if tidal_prefetch:
-            logger.info(f"Deezer track {item_id} failed; awaiting parallel Tidal fallback")
-            fallback_stream = await tidal_prefetch
+        if settings.enable_fallback and tidal.is_configured():
+            logger.info(f"Deezer track {item_id} failed; executing Tidal fallback")
+            fallback_stream = await _deezer_to_tidal_fallback(item_id, quality, dynamic_host)
             if fallback_stream:
                 return fallback_stream
 

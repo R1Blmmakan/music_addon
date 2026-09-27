@@ -31,6 +31,7 @@ class DeezerProvider(MusicProvider):
         self._api_token: str | None = None
         self._license_token: str | None = None
         self._session_initialized_at: float = 0.0
+        self._cdn_cache: dict[str, tuple[str, str, float]] = {}
 
     @property
     def name(self) -> str:
@@ -134,7 +135,15 @@ class DeezerProvider(MusicProvider):
             return None
 
     async def get_cdn_url(self, track_id: str, quality: str = "lossless") -> tuple[str | None, str]:
-        """Request media delivery stream URL from Deezer media API."""
+        """Request media delivery stream URL from Deezer media API (cached for 2h)."""
+        cache_key = f"{track_id}:{quality.lower()}"
+        cached = self._cdn_cache.get(cache_key)
+        if cached:
+            url, fmt, ts = cached
+            # Deezer CDN URLs are valid for 20h; 2h TTL (7200s) is completely safe
+            if time.time() - ts < 7200:
+                return url, fmt
+
         song_data = await self.get_track_data(track_id)
         if not song_data:
             return None, "flac"
@@ -173,7 +182,14 @@ class DeezerProvider(MusicProvider):
             sources = first_media.get("sources", [])
             chosen_format = first_media.get("format", "FLAC").lower()
             if sources:
-                return sources[0].get("url"), chosen_format
+                src_url = sources[0].get("url")
+                if src_url:
+                    if len(self._cdn_cache) > 200:
+                        oldest_keys = sorted(self._cdn_cache, key=lambda k: self._cdn_cache[k][2])[:50]
+                        for k in oldest_keys:
+                            self._cdn_cache.pop(k, None)
+                    self._cdn_cache[cache_key] = (src_url, chosen_format, time.time())
+                return src_url, chosen_format
             return None, chosen_format
         except Exception as exc:
             logger.error(f"Deezer media get_url error: {exc}")
