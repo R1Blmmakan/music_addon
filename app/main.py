@@ -260,6 +260,24 @@ async def _resolve_stream_inner(
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
+def _clean_title_for_search(title: str) -> str:
+    """Strip parenthetical suffixes that cause Deezer to return remixes over originals.
+
+    Keeps the core title while removing:
+      (feat. ...), (ft. ...), (with ...), (Radio Edit), (Extended), (Live at ...), etc.
+    Artist feat. credits are still included via the artist field in the query.
+    """
+    # Remove feat./ft./with collaborator credits
+    title = re.sub(r'\s*\((?:feat|ft|with)\.?[^)]*\)', '', title, flags=re.IGNORECASE)
+    # Remove common version/edition suffixes
+    title = re.sub(
+        r'\s*\((?:radio edit|extended|extended mix|single version|album version|'
+        r'live(?: at [^)]*)?|remaster(?:ed)?(?:[^)]*)?|acoustic|instrumental|clean|explicit)\.?\)',
+        '', title, flags=re.IGNORECASE,
+    )
+    return title.strip()
+
+
 async def _tidal_to_deezer_fallback(
     item_id: str,
     quality: str,
@@ -286,14 +304,15 @@ async def _tidal_to_deezer_fallback(
             title = meta.get("title", "").strip()
             artist = meta.get("artist", {}).get("name", "").strip()
             if title and artist:
-                query = f"{title} {artist}"
+                clean = _clean_title_for_search(title)
+                query = f"{clean} {artist}"
     except Exception as exc:
         logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
 
     # Tidal 404 or missing metadata: use hints passed from search index if available
     if not query:
         if hint_title and hint_artist:
-            query = f"{hint_title} {hint_artist}"
+            query = f"{_clean_title_for_search(hint_title)} {hint_artist}"
             logger.info(f"Tidal metadata unavailable for {clean_id}; using search hint: {query!r}")
         else:
             logger.warning(f"No query available for Deezer fallback on {clean_id}")
