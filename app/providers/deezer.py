@@ -109,6 +109,8 @@ class DeezerProvider(MusicProvider):
             q_lower = clean_query.lower()
             query_wants_remix = "remix" in q_lower
             q_words = [w for w in re.sub(r'[^\w\s]', '', q_lower).split() if len(w) > 1 and w not in ("with", "feat", "ft")]
+            format_keywords = {"remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"}
+            artist_q_words = [w for w in q_words if w not in format_keywords]
 
             junk_keywords = (
                 "karaoke", "tribute", "originally performed", "in the style of",
@@ -118,9 +120,11 @@ class DeezerProvider(MusicProvider):
 
             scored = []
             for idx, item in enumerate(items):
-                title = item.get("title", "").strip().lower()
-                title_version = (item.get("title_version") or "").strip().lower()
-                full_title = f"{title} {title_version}".strip()
+                raw_title = item.get("title", "").strip()
+                title = raw_title.lower()
+                title_version = (item.get("title_version") or "").strip()
+                core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE).strip()
+                full_title = f"{title} {title_version.lower()}".strip()
                 artist = item.get("artist", {}).get("name", "").strip().lower()
                 rank = int(item.get("rank", 0) or 0)
 
@@ -142,12 +146,28 @@ class DeezerProvider(MusicProvider):
                     elif not title_version:
                         score -= 300  # Bonus for canonical album track
 
-                # Word matching
-                matched_title = sum(1 for w in q_words if w in title)
-                matched_artist = sum(1 for w in q_words if w in artist)
-                score -= (120 * matched_title + 100 * matched_artist)
-                if matched_title > 0 and matched_artist > 0:
-                    score -= 250
+                # Title matching (using core_title without feat fluff)
+                if core_title == q_lower or full_title == q_lower:
+                    score -= 600
+                elif core_title in q_lower or q_lower.startswith(core_title):
+                    score -= 400
+                else:
+                    matched_title = sum(1 for w in q_words if w in core_title.split() and w not in format_keywords)
+                    if matched_title > 0:
+                        score -= 150 * matched_title
+                    else:
+                        score += 400  # Penalty for completely wrong title
+
+                # Artist matching (ignoring format keywords)
+                matched_artist = sum(1 for w in artist_q_words if w in artist.split())
+                score -= 100 * matched_artist
+
+                # Synergy bonus
+                if len(q_words) >= 2 and artist_q_words:
+                    has_title_match = any(w in core_title.split() for w in q_words if w not in format_keywords)
+                    has_artist_match = any(w in artist.split() for w in artist_q_words)
+                    if has_title_match and has_artist_match:
+                        score -= 300
 
                 # Popularity rank bonus
                 score -= min(int(rank / 10000), 100)
@@ -163,9 +183,15 @@ class DeezerProvider(MusicProvider):
                     or item.get("album", {}).get("cover_big")
                     or item.get("album", {}).get("cover_medium")
                 )
+                raw_t = item.get("title", "").strip()
+                t_ver = (item.get("title_version") or "").strip()
+                dz_title = raw_t
+                if t_ver and t_ver.lower() not in raw_t.lower():
+                    dz_title = f"{raw_t} ({t_ver})".strip()
+
                 tracks.append({
                     "id": f"dz:{item['id']}",
-                    "title": item.get("title", ""),
+                    "title": dz_title,
                     "artist": item.get("artist", {}).get("name", ""),
                     "album": item.get("album", {}).get("title", ""),
                     "duration": float(item.get("duration", 0)),

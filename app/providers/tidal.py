@@ -115,13 +115,17 @@ class TidalProvider(MusicProvider):
 
     def _auth_headers(self) -> dict:
         access_token = self.token_data.get("access_token", "") if self.token_data else ""
-        return {
-            "authorization": f"Bearer {access_token}",
+        headers = {
             "User-Agent": "okhttp/5.3.2",
             "Accept": "application/json",
             "X-Platform": "android",
             "X-Tidal-Platform": "android",
         }
+        if access_token and not access_token.startswith("CzET"):
+            headers["authorization"] = f"Bearer {access_token}"
+        else:
+            headers["x-tidal-token"] = access_token or "CzET4vdadNUFQ5JU"
+        return headers
 
     async def health(self) -> bool:
         """Verify Tidal API accessibility and token validity."""
@@ -187,7 +191,11 @@ class TidalProvider(MusicProvider):
                 return []
 
             query_lower = clean_query.lower()
-            query_words = [w for w in query_lower.split() if len(w) > 1]
+            query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if len(w) > 1]
+            query_wants_remix = "remix" in query_lower
+
+            format_keywords = {"remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"}
+            artist_query_words = [w for w in query_words if w not in format_keywords]
 
             junk_keywords = (
                 "karaoke", "tribute", "originally performed",
@@ -201,9 +209,11 @@ class TidalProvider(MusicProvider):
                 if item.get("type") == "video":
                     continue
 
-                t_title = item.get("title", "").strip().lower()
-                t_version = (item.get("version") or "").strip().lower()
-                full_title = f"{t_title} {t_version}".strip()
+                raw_title = item.get("title", "").strip()
+                t_title = raw_title.lower()
+                t_version = (item.get("version") or "").strip()
+                core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', t_title, flags=re.IGNORECASE).strip()
+                full_title = f"{t_title} {t_version.lower()}".strip()
                 t_artist = item.get("artist", {}).get("name", "").strip().lower()
                 popularity = int(item.get("popularity", 0) or 0)
 
@@ -225,7 +235,6 @@ class TidalProvider(MusicProvider):
                 score = 1000 if is_junk else 0
 
                 # Strict remix permission gate
-                query_wants_remix = "remix" in query_lower
                 if query_wants_remix:
                     if is_remix:
                         score -= 500  # Priority bonus for remix
@@ -237,28 +246,29 @@ class TidalProvider(MusicProvider):
                     elif not t_version:
                         score -= 300  # Bonus for canonical album track
 
-                if t_title == query_lower or full_title == query_lower:
+                # Title matching (using core_title without feat fluff)
+                if core_title == query_lower or full_title == query_lower:
                     score -= 600
-                elif full_title.startswith(query_lower):
+                elif core_title in query_lower or query_lower.startswith(core_title):
                     score -= 400
-                elif query_lower in full_title:
-                    score -= 300
-                elif query_words and any(w in t_title for w in query_words):
-                    matched_title_words = sum(1 for w in query_words if w in t_title)
-                    score -= 150 * matched_title_words
                 else:
-                    score += 400
+                    matched_title_words = sum(1 for w in query_words if w in core_title.split() and w not in format_keywords)
+                    if matched_title_words > 0:
+                        score -= 150 * matched_title_words
+                    else:
+                        score += 500  # Penalty for completely unrelated title
 
-                if t_artist == query_lower or query_lower in t_artists_str:
-                    score -= 300
-                elif query_words and any(w in t_artists_str for w in query_words):
-                    matched_artist_words = sum(1 for w in query_words if w in t_artists_str)
+                # Artist matching (ignoring format keywords so 'Remix Guys' don't get artist points)
+                matched_artist_words = sum(1 for w in artist_query_words if any(w == a_w for a_w in t_artists_str.split()))
+                if matched_artist_words > 0:
                     score -= 100 * matched_artist_words
+                    if t_artists_str in query_lower or any(a.lower() in query_lower for a in all_artists):
+                        score -= 200
 
                 # Synergy bonus when query words hit both title and artist
-                if len(query_words) >= 2:
-                    has_title_match = any(w in t_title for w in query_words)
-                    has_artist_match = any(w in t_artist for w in query_words)
+                if len(query_words) >= 2 and artist_query_words:
+                    has_title_match = any(w in core_title.split() for w in query_words if w not in format_keywords)
+                    has_artist_match = any(w in t_artists_str.split() for w in artist_query_words)
                     if has_title_match and has_artist_match:
                         score -= 400
 
@@ -290,10 +300,21 @@ class TidalProvider(MusicProvider):
                 if cover_hash:
                     artwork = f"https://resources.tidal.com/images/{cover_hash.replace('-', '/')}/1280x1280.jpg"
 
+                raw_t = item.get("title", "").strip()
+                t_ver = (item.get("version") or "").strip()
+                display_title = f"{raw_t} ({t_ver})" if t_ver else raw_t
+
+                artists_list = [item.get("artist", {}).get("name", "")]
+                for a in item.get("artists", []):
+                    a_name = a.get("name")
+                    if a_name and a_name not in artists_list:
+                        artists_list.append(a_name)
+                display_artist = ", ".join(artists_list).strip()
+
                 tracks.append({
                     "id": f"td:{item['id']}",
-                    "title": item.get("title", ""),
-                    "artist": item.get("artist", {}).get("name", ""),
+                    "title": display_title,
+                    "artist": display_artist,
                     "album": item.get("album", {}).get("title", ""),
                     "duration": float(item.get("duration", 0)),
                     "artwork": artwork,

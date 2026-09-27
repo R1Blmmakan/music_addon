@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BitChord Unified Lossless Addon",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -143,7 +143,7 @@ async def manifest():
     return {
         "id": "unified-lossless-homelab",
         "name": "Homelab HiFi",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "resources": ["search", "stream"],
         "settings": [
             {
@@ -330,6 +330,8 @@ async def _tidal_to_deezer_fallback(
     if hint_title and hint_artist:
         is_remix = "remix" in hint_title.lower()
         clean = _clean_title_for_search(hint_title, preserve_remix=is_remix)
+        if is_remix and "remix" not in clean.lower():
+            clean = f"{clean} Remix"
         query = f"{clean} {hint_artist}"
         logger.debug(f"Direct hint query for Deezer fallback: {query!r}")
     else:
@@ -344,7 +346,12 @@ async def _tidal_to_deezer_fallback(
                 meta = meta_resp.json()
                 title = meta.get("title", "").strip()
                 version = (meta.get("version") or "").strip()
-                artist = meta.get("artist", {}).get("name", "").strip()
+                artists_list = [meta.get("artist", {}).get("name", "")]
+                for a in meta.get("artists", []):
+                    a_name = a.get("name")
+                    if a_name and a_name not in artists_list:
+                        artists_list.append(a_name)
+                artist = ", ".join(artists_list).strip()
                 if title and artist:
                     is_remix = "remix" in f"{title} {version}".lower()
                     clean = _clean_title_for_search(title, preserve_remix=is_remix)
@@ -358,11 +365,12 @@ async def _tidal_to_deezer_fallback(
         logger.warning(f"No query available for Deezer fallback on {clean_id}")
         return None
 
-    dz_matches = await deezer.search(query, limit=1)
+    clean_query = sanitize_search_query(query)
+    dz_matches = await deezer.search(clean_query, limit=3)
     for match in dz_matches:
         stream = await deezer.get_stream(match["id"], quality)
         if stream and stream.get("url"):
-            logger.info(f"Deezer fallback resolved {query!r} to {match['id']}")
+            logger.info(f"Deezer fallback resolved {clean_query!r} to {match['id']}")
             return stream
     return None
 
