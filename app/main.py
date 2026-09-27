@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="BitChord Unified Lossless Addon",
-    version="3.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -142,8 +142,8 @@ async def manifest():
     """BitChord addon discovery contract."""
     return {
         "id": "unified-lossless-homelab",
-        "name": "Homelab HiFi (Tidal + Deezer)",
-        "version": "1.0.0",
+        "name": "Homelab HiFi",
+        "version": "2.0.0",
         "resources": ["search", "stream"],
         "settings": [
             {
