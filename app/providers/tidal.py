@@ -207,21 +207,35 @@ class TidalProvider(MusicProvider):
                 t_artist = item.get("artist", {}).get("name", "").strip().lower()
                 popularity = int(item.get("popularity", 0) or 0)
 
-                # Demote junk unless the query itself requests it (e.g. user searches "slowed")
+                all_artists = [item.get("artist", {}).get("name", "")]
+                for a in item.get("artists", []):
+                    a_name = a.get("name")
+                    if a_name and a_name not in all_artists:
+                        all_artists.append(a_name)
+                t_artists_str = " ".join(all_artists).strip().lower()
+
+                is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
+
+                # Demote junk unless the query itself requests it
                 is_junk = any(
-                    k in full_title or k in t_artist
+                    k in full_title or k in t_artists_str
                     for k in junk_keywords
                     if k not in query_lower
                 )
+                score = 1000 if is_junk else 0
 
-                score = 300 if is_junk else 0
-
-                # Demote versions/remixes unless user specifically queried for them
-                query_wants_version = any(v in query_lower for v in ("remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"))
-                if t_version and not query_wants_version:
-                    score += 350
-                elif not t_version and not query_wants_version:
-                    score -= 200  # Bonus for canonical album track
+                # Strict remix permission gate
+                query_wants_remix = "remix" in query_lower
+                if query_wants_remix:
+                    if is_remix:
+                        score -= 500  # Priority bonus for remix
+                    else:
+                        score += 400  # Demote original when user specifically asked for remix
+                else:
+                    if is_remix:
+                        score += 800  # Heavily demote remixes when user did not ask for remix
+                    elif not t_version:
+                        score -= 300  # Bonus for canonical album track
 
                 if t_title == query_lower or full_title == query_lower:
                     score -= 600
@@ -235,10 +249,10 @@ class TidalProvider(MusicProvider):
                 else:
                     score += 400
 
-                if t_artist == query_lower or query_lower in t_artist:
+                if t_artist == query_lower or query_lower in t_artists_str:
                     score -= 300
-                elif query_words and any(w in t_artist for w in query_words):
-                    matched_artist_words = sum(1 for w in query_words if w in t_artist)
+                elif query_words and any(w in t_artists_str for w in query_words):
+                    matched_artist_words = sum(1 for w in query_words if w in t_artists_str)
                     score -= 100 * matched_artist_words
 
                 # Synergy bonus when query words hit both title and artist

@@ -88,16 +88,76 @@ class DeezerProvider(MusicProvider):
         return await self._ensure_session()
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
-        """Search Deezer public catalogue without requiring authenticated session."""
+        """Search Deezer public catalogue with smart remix filtering and canonical ranking."""
+        clean_query = re.sub(r'\s+(?:with|feat\.?|ft\.?|featuring)\s+', ' ', query.strip(), flags=re.IGNORECASE)
+        clean_query = re.sub(r'\s+', ' ', clean_query).strip()
+        if not clean_query:
+            return []
+
         try:
             url = "https://api.deezer.com/search"
-            resp = await self.client.get(url, params={"q": query, "limit": limit})
+            # Fetch extra candidates to allow ranking and remix filtering
+            fetch_limit = max(limit * 2, 25)
+            resp = await self.client.get(url, params={"q": clean_query, "limit": fetch_limit})
             if resp.status_code != 200:
                 return []
 
             items = resp.json().get("data", [])
+            if not items:
+                return []
+
+            q_lower = clean_query.lower()
+            query_wants_remix = "remix" in q_lower
+            q_words = [w for w in re.sub(r'[^\w\s]', '', q_lower).split() if len(w) > 1 and w not in ("with", "feat", "ft")]
+
+            junk_keywords = (
+                "karaoke", "tribute", "originally performed", "in the style of",
+                "backing track", "piano tribute", "lullaby", "8-bit", "emulation",
+                "made popular by", "party tyme", "instrumental"
+            )
+
+            scored = []
+            for idx, item in enumerate(items):
+                title = item.get("title", "").strip().lower()
+                title_version = (item.get("title_version") or "").strip().lower()
+                full_title = f"{title} {title_version}".strip()
+                artist = item.get("artist", {}).get("name", "").strip().lower()
+                rank = int(item.get("rank", 0) or 0)
+
+                is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
+
+                # Demote junk / karaoke
+                is_junk = any(k in full_title or k in artist for k in junk_keywords if k not in q_lower)
+                score = 1000 if is_junk else 0
+
+                # Strict remix permission gate
+                if query_wants_remix:
+                    if is_remix:
+                        score -= 500  # Priority bonus for remix
+                    else:
+                        score += 400  # Demote original when user specifically asked for remix
+                else:
+                    if is_remix:
+                        score += 800  # Heavily demote remixes when user did not ask for remix
+                    elif not title_version:
+                        score -= 300  # Bonus for canonical album track
+
+                # Word matching
+                matched_title = sum(1 for w in q_words if w in title)
+                matched_artist = sum(1 for w in q_words if w in artist)
+                score -= (120 * matched_title + 100 * matched_artist)
+                if matched_title > 0 and matched_artist > 0:
+                    score -= 250
+
+                # Popularity rank bonus
+                score -= min(int(rank / 10000), 100)
+                scored.append((score, idx, item))
+
+            scored.sort(key=lambda x: (x[0], x[1]))
+            best_items = [x[2] for x in scored[:limit]]
+
             tracks = []
-            for item in items:
+            for item in best_items:
                 artwork = (
                     item.get("album", {}).get("cover_xl")
                     or item.get("album", {}).get("cover_big")

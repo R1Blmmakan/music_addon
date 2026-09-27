@@ -158,10 +158,15 @@ async def manifest():
         ]
     }
 
+def sanitize_search_query(query: str) -> str:
+    """Normalize query strings to avoid search engine dead-ends with connector words."""
+    cleaned = re.sub(r'\s+(?:with|feat\.?|ft\.?|featuring)\s+', ' ', query.strip(), flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
 @app.get("/search")
 async def search(q: str, quality: str = "lossless"):
     """Multi-provider search aggregation respecting PREFERRED_PROVIDER order."""
-    query = q.strip()
+    query = sanitize_search_query(q)
     if not query:
         return {"tracks": []}
 
@@ -267,27 +272,43 @@ async def _resolve_stream_inner(
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
-def _clean_title_for_search(title: str) -> str:
-    """Strip parenthetical and version suffixes that cause Deezer to return remixes over originals.
+def _clean_title_for_search(title: str, preserve_remix: bool = False) -> str:
+    """Strip collaborator and version suffixes from title for clean fallback search.
 
-    Keeps the core title while removing:
-      (feat. ...), [feat. ...], (Radio Edit), (Extended), (Remix), etc.
+    If preserve_remix is True, 'Remix' keywords are preserved.
+    If False, remixes and other version tags are stripped.
     """
+    has_remix = bool(re.search(r'\b(?:remix|mix)\b', title, re.IGNORECASE))
+
     # Remove feat./ft./with collaborator credits in parens or brackets
-    title = re.sub(r'\s*[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE)
-    # Remove common version/edition suffixes in parens or brackets
-    title = re.sub(
-        r'\s*[\(\[](?:radio edit|extended|extended mix|single version|album version|'
-        r'live(?: at [^\)\]]*)?|remaster(?:ed)?(?:[^\)\]]*)?|acoustic|instrumental|clean|explicit|'
-        r'deluxe(?: edition)?|bonus track)[\)\]]',
-        '', title, flags=re.IGNORECASE,
-    )
-    # Remove trailing hyphenated version info like " - Radio Edit", " - Remastered 2011"
-    title = re.sub(
-        r'\s*-\s*(?:radio edit|extended mix|single version|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
-        '', title, flags=re.IGNORECASE,
-    )
-    return title.strip()
+    cleaned = re.sub(r'\s*[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE)
+
+    if preserve_remix and has_remix:
+        # Keep remix indicator, remove other fluff
+        cleaned = re.sub(
+            r'\s*[\(\[](?:radio edit|extended|extended mix|single version|album version|'
+            r'live(?: at [^\)\]]*)?|remaster(?:ed)?(?:[^\]\)]*)?|acoustic|instrumental|clean|explicit|'
+            r'deluxe(?: edition)?|bonus track)[\)\]]',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r'\s*-\s*(?:radio edit|extended mix|single version|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+    else:
+        # Strip all version and remix suffixes
+        cleaned = re.sub(
+            r'\s*[\(\[](?:radio edit|extended|extended mix|single version|album version|'
+            r'remix|mix|dub|edit|'
+            r'live(?: at [^\)\]]*)?|remaster(?:ed)?(?:[^\)\]]*)?|acoustic|instrumental|clean|explicit|'
+            r'deluxe(?: edition)?|bonus track)[\)\]]',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r'\s*-\s*(?:radio edit|extended mix|single version|remix|mix|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+    return cleaned.strip()
 
 
 async def _tidal_to_deezer_fallback(
@@ -307,7 +328,9 @@ async def _tidal_to_deezer_fallback(
 
     # Short-circuit: if hints were provided by the caller, use them immediately
     if hint_title and hint_artist:
-        query = f"{_clean_title_for_search(hint_title)} {hint_artist}"
+        is_remix = "remix" in hint_title.lower()
+        clean = _clean_title_for_search(hint_title, preserve_remix=is_remix)
+        query = f"{clean} {hint_artist}"
         logger.debug(f"Direct hint query for Deezer fallback: {query!r}")
     else:
         from app.providers.tidal import API_BASE
@@ -320,9 +343,13 @@ async def _tidal_to_deezer_fallback(
             if meta_resp.status_code == 200:
                 meta = meta_resp.json()
                 title = meta.get("title", "").strip()
+                version = (meta.get("version") or "").strip()
                 artist = meta.get("artist", {}).get("name", "").strip()
                 if title and artist:
-                    clean = _clean_title_for_search(title)
+                    is_remix = "remix" in f"{title} {version}".lower()
+                    clean = _clean_title_for_search(title, preserve_remix=is_remix)
+                    if is_remix and "remix" not in clean.lower():
+                        clean = f"{clean} Remix"
                     query = f"{clean} {artist}"
         except Exception as exc:
             logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
