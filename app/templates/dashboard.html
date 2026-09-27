@@ -93,6 +93,16 @@
       font-size: 0.85rem;
       color: var(--text-muted);
     }
+    .status-text {
+      margin-top: 0.5rem;
+      font-weight: 600;
+    }
+    .status-text.dot-active {
+      color: var(--green);
+    }
+    .status-text.dot-idle {
+      color: var(--yellow);
+    }
     .endpoint-list {
       list-style: none;
       margin-top: 1rem;
@@ -149,13 +159,13 @@
       <div class="card">
         <h2>Deezer Provider <span class="status-dot {{dz_status_class}}"></span></h2>
         <p>16-bit 44.1kHz FLAC streams with real-time Blowfish CBC chunk decryption and HTTP 206 partial content support.</p>
-        <p style="margin-top:0.5rem; font-weight:600; color:{{dz_color}};">{{dz_status_text}}</p>
+        <p class="status-text {{dz_status_class}}">{{dz_status_text}}</p>
       </div>
 
       <div class="card">
         <h2>Tidal Provider <span class="status-dot {{td_status_class}}"></span></h2>
         <p>24-bit Hi-Res FLAC, Dolby Atmos, and MPEG-DASH manifest resolution via upstream hifi-api instance.</p>
-        <p style="margin-top:0.5rem; font-weight:600; color:{{td_color}};">{{td_status_text}}</p>
+        <p class="status-text {{td_status_class}}">{{td_status_text}}</p>
       </div>
     </div>
 
