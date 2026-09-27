@@ -3,197 +3,715 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BitChord Lossless Addon</title>
+  <title>BitChord Lossless Relay</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #090b10;
-      --surface: #121620;
-      --border: #1e2433;
-      --text: #e6edf3;
-      --text-muted: #8b949e;
-      --accent: #38bdf8;
-      --green: #22c55e;
-      --yellow: #eab308;
+      --bg: #0d0e12;
+      --panel: #15171e;
+      --panel-elevated: #1b1e28;
+      --border: #262933;
+      --border-subtle: #1f222b;
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --emerald: #10b981;
+      --emerald-subtle: rgba(16, 185, 129, 0.12);
+      --amber: #f59e0b;
+      --amber-subtle: rgba(245, 158, 11, 0.12);
+      --cyan: #38bdf8;
+      --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
     body {
-      background: var(--bg);
+      background-color: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      font-family: var(--font-sans);
+      font-size: 15px;
       line-height: 1.6;
-      padding: 2.5rem 1.5rem;
+      min-height: 100vh;
+      padding: 2.5rem 1.25rem;
       display: flex;
       justify-content: center;
     }
-    .container {
+
+    .rack-chassis {
       width: 100%;
-      max-width: 760px;
+      max-width: 820px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
     }
-    header {
-      margin-bottom: 2rem;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 1.5rem;
+
+    /* Faceplate Header */
+    .faceplate {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.5rem;
     }
-    .badge {
-      display: inline-block;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      padding: 0.2rem 0.6rem;
-      border-radius: 4px;
-      font-weight: 600;
-      margin-bottom: 0.75rem;
+
+    .faceplate-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
     }
-    .badge-online {
-      background: rgba(34, 197, 94, 0.15);
-      color: var(--green);
-      border: 1px solid rgba(34, 197, 94, 0.3);
-    }
-    h1 {
-      font-size: 1.8rem;
+
+    .system-title {
+      font-size: 1.35rem;
       font-weight: 700;
       letter-spacing: -0.02em;
-      margin-bottom: 0.4rem;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
     }
-    .desc {
+
+    .system-version {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-dim);
+      padding: 0.15rem 0.45rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+    }
+
+    .system-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.65rem;
+      background: var(--emerald-subtle);
+      color: var(--emerald);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 3px;
+    }
+
+    .system-status-led {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--emerald);
+    }
+
+    .system-desc {
       color: var(--text-muted);
-      font-size: 0.95rem;
+      font-size: 0.92rem;
+      margin-bottom: 1.25rem;
     }
-    .grid {
+
+    .telemetry-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.75rem;
+      border-top: 1px solid var(--border-subtle);
+      padding-top: 1.25rem;
+    }
+
+    .telemetry-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+    }
+
+    .telemetry-label {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+    }
+
+    .telemetry-value {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    /* Section Panels */
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1.5rem;
+    }
+
+    .panel-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.35rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-subtitle {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      margin-bottom: 1.25rem;
+    }
+
+    /* Provider Bay Grid */
+    .provider-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 1rem;
-      margin-bottom: 1.5rem;
     }
-    @media (max-width: 600px) {
-      .grid { grid-template-columns: 1fr; }
+
+    @media (max-width: 640px) {
+      .provider-grid {
+        grid-template-columns: 1fr;
+      }
     }
-    .card {
-      background: var(--surface);
+
+    .provider-bay {
+      background: var(--panel-elevated);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 4px;
       padding: 1.25rem;
-    }
-    .card h2 {
-      font-size: 1.05rem;
-      margin-bottom: 0.75rem;
       display: flex;
-      align-items: center;
+      flex-direction: column;
       justify-content: space-between;
     }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
+
+    .bay-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
     }
-    .dot-active { background: var(--green); box-shadow: 0 0 8px var(--green); }
-    .dot-idle { background: var(--yellow); }
-    .card p {
+
+    .bay-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .bay-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      padding: 0.15rem 0.45rem;
+      border-radius: 3px;
+    }
+
+    .indicator-active {
+      background: var(--emerald-subtle);
+      color: var(--emerald);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .indicator-idle {
+      background: var(--amber-subtle);
+      color: var(--amber);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .led {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .indicator-active .led { background: var(--emerald); }
+    .indicator-idle .led { background: var(--amber); }
+
+    .specs-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      margin-bottom: 1rem;
+    }
+
+    .specs-item {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    .specs-item::before {
+      content: "";
+      width: 3px;
+      height: 3px;
+      background: var(--text-dim);
+      border-radius: 50%;
+    }
+
+    .bay-footer {
+      font-size: 0.8rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border-subtle);
+      font-family: var(--font-mono);
+    }
+
+    .bay-footer.status-active { color: var(--emerald); }
+    .bay-footer.status-idle { color: var(--amber); }
+
+    /* Client Setup Station */
+    .setup-station {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .field-label {
       font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .field-hint {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+    }
+
+    .input-wrapper {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .text-input {
+      flex: 1;
+      background: var(--panel-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.6rem 0.8rem;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    .text-input:focus-visible {
+      border-color: var(--cyan);
+    }
+
+    .copy-btn {
+      background: var(--panel-elevated);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.6rem 1rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      white-space: nowrap;
+      transition: background 0.15s ease, border-color 0.15s ease;
+      min-height: 44px;
+    }
+
+    .copy-btn:hover {
+      background: #202431;
+      border-color: #3b4256;
+    }
+
+    .copy-btn:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
+    }
+
+    .copy-btn.copied {
+      background: var(--emerald-subtle);
+      color: var(--emerald);
+      border-color: rgba(16, 185, 129, 0.4);
+    }
+
+    .result-box {
+      background: #0f1117;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.85rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .result-label {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+    }
+
+    .result-url {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      color: var(--cyan);
+      word-break: break-all;
+    }
+
+    .steps-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+
+    .step-item {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      display: flex;
+      align-items: baseline;
+      gap: 0.6rem;
+    }
+
+    .step-number {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--border);
+      padding: 0.1rem 0.35rem;
+      border-radius: 3px;
+    }
+
+    /* Protocol Specification Table */
+    .protocol-table-wrapper {
+      overflow-x: auto;
+    }
+
+    .protocol-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+
+    .protocol-table th {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      padding: 0.65rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .protocol-table td {
+      padding: 0.75rem 0.85rem;
+      border-bottom: 1px solid var(--border-subtle);
       color: var(--text-muted);
     }
-    .status-text {
-      margin-top: 0.5rem;
+
+    .protocol-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .http-method {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
       font-weight: 600;
-    }
-    .status-text.dot-active {
-      color: var(--green);
-    }
-    .status-text.dot-idle {
-      color: var(--yellow);
-    }
-    .endpoint-list {
-      list-style: none;
-      margin-top: 1rem;
-    }
-    .endpoint-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.75rem 0;
-      border-bottom: 1px solid var(--border);
-      font-size: 0.85rem;
-    }
-    .endpoint-item:last-child { border-bottom: none; }
-    .method {
-      background: #1f293d;
-      color: #7dd3fc;
-      padding: 0.15rem 0.45rem;
-      border-radius: 4px;
-      font-family: monospace;
-      font-size: 0.75rem;
-      margin-right: 0.5rem;
-    }
-    a {
-      color: var(--accent);
-      text-decoration: none;
-    }
-    a:hover { text-decoration: underline; }
-    .callout {
-      background: #0f172a;
-      border-left: 3px solid var(--accent);
-      padding: 1rem;
-      border-radius: 0 6px 6px 0;
-      font-size: 0.85rem;
-      margin-top: 1.5rem;
-    }
-    code {
-      background: #1a2234;
-      padding: 0.15rem 0.35rem;
+      color: #93c5fd;
+      background: rgba(59, 130, 246, 0.12);
+      padding: 0.15rem 0.4rem;
       border-radius: 3px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .endpoint-code {
+      font-family: var(--font-mono);
       font-size: 0.82rem;
+      color: var(--text);
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      padding: 1rem 0;
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <span class="badge badge-online">Relay Operational</span>
-      <h1>BitChord Lossless Addon</h1>
-      <p class="desc">Self-hosted high-resolution audio proxy and multi-provider fallback engine.</p>
+  <div class="rack-chassis">
+
+    <!-- Faceplate Header -->
+    <header class="faceplate">
+      <div class="faceplate-header">
+        <h1 class="system-title">
+          BitChord Audio Relay
+          <span class="system-version">BC-RELAY // 1.0</span>
+        </h1>
+        <div class="system-status">
+          <span class="system-status-led"></span>
+          ENGINE OPERATIONAL
+        </div>
+      </div>
+      <p class="system-desc">
+        High-resolution stream decryption proxy and automated provider fallback engine for the BitChord ecosystem.
+      </p>
+
+      <div class="telemetry-strip">
+        <div class="telemetry-cell">
+          <span class="telemetry-label">Primary Route</span>
+          <span class="telemetry-value">{{preferred_provider}}</span>
+        </div>
+        <div class="telemetry-cell">
+          <span class="telemetry-label">Fallback Engine</span>
+          <span class="telemetry-value">{{fallback_status}}</span>
+        </div>
+        <div class="telemetry-cell">
+          <span class="telemetry-label">Gateway Host</span>
+          <span class="telemetry-value">{{public_host}}</span>
+        </div>
+      </div>
     </header>
 
-    <div class="grid">
-      <div class="card">
-        <h2>Deezer Provider <span class="status-dot {{dz_status_class}}"></span></h2>
-        <p>16-bit 44.1kHz FLAC streams with real-time Blowfish CBC chunk decryption and HTTP 206 partial content support.</p>
-        <p class="status-text {{dz_status_class}}">{{dz_status_text}}</p>
+    <!-- Provider Pipelines -->
+    <section class="panel">
+      <h2 class="panel-title">Audio Pipeline Channels</h2>
+      <p class="panel-subtitle">Current status and capability specifications for configured upstream providers.</p>
+
+      <div class="provider-grid">
+        <!-- Deezer Channel -->
+        <article class="provider-bay">
+          <div>
+            <div class="bay-header">
+              <h3 class="bay-title">Channel 01: Deezer FLAC</h3>
+              <span class="bay-indicator {{dz_indicator_class}}">
+                <span class="led"></span>
+                {{dz_status_label}}
+              </span>
+            </div>
+            <ul class="specs-list">
+              <li class="specs-item">16-bit / 44.1kHz Lossless FLAC</li>
+              <li class="specs-item">Blowfish-CBC stripe decryption</li>
+              <li class="specs-item">HTTP 206 range-buffered transport</li>
+              <li class="specs-item">2-Hour in-memory CDN token cache</li>
+            </ul>
+          </div>
+          <div class="bay-footer {{dz_status_class}}">
+            {{dz_status_text}}
+          </div>
+        </article>
+
+        <!-- Tidal Channel -->
+        <article class="provider-bay">
+          <div>
+            <div class="bay-header">
+              <h3 class="bay-title">Channel 02: Tidal Hi-Res</h3>
+              <span class="bay-indicator {{td_indicator_class}}">
+                <span class="led"></span>
+                {{td_status_label}}
+              </span>
+            </div>
+            <ul class="specs-list">
+              <li class="specs-item">Hi-Res Lossless / Lossless FLAC</li>
+              <li class="specs-item">MPEG-DASH fMP4 sample rate patching</li>
+              <li class="specs-item">Automated zero-delay Deezer fallback</li>
+              <li class="specs-item">Session token auto-refresh</li>
+            </ul>
+          </div>
+          <div class="bay-footer {{td_status_class}}">
+            {{td_status_text}}
+          </div>
+        </article>
       </div>
+    </section>
 
-      <div class="card">
-        <h2>Tidal Provider <span class="status-dot {{td_status_class}}"></span></h2>
-        <p>24-bit Hi-Res FLAC, Dolby Atmos, and MPEG-DASH manifest resolution via upstream hifi-api instance.</p>
-        <p class="status-text {{td_status_class}}">{{td_status_text}}</p>
+    <!-- Client Connection Station -->
+    <section class="panel">
+      <h2 class="panel-title">BitChord Client Connection</h2>
+      <p class="panel-subtitle">
+        Generate your personal BitChord Android source URL. Tokens are handled locally in your browser memory and are never transmitted to this landing page.
+      </p>
+
+      <div class="setup-station">
+        <div class="field-group">
+          <label class="field-label" for="tokenInput">
+            Secret Access Token
+            <span class="field-hint">Stored locally in browser</span>
+          </label>
+          <div class="input-wrapper">
+            <input 
+              type="text" 
+              id="tokenInput" 
+              class="text-input" 
+              placeholder="Paste your ACCESS_TOKEN (e.g. MySecretToken)"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <button id="copyBtn" class="copy-btn" type="button" aria-label="Copy connection URL to clipboard">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              <span id="copyBtnText">Copy URL</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="result-box">
+          <span class="result-label">Generated BitChord Source URL</span>
+          <code id="resultUrl" class="result-url">Loading...</code>
+        </div>
+
+        <ul class="steps-list">
+          <li class="step-item">
+            <span class="step-number">1</span>
+            <span>Open the BitChord app on your Android device.</span>
+          </li>
+          <li class="step-item">
+            <span class="step-number">2</span>
+            <span>Navigate to <strong>Settings</strong> &gt; <strong>Sources</strong> &gt; <strong>Add Source</strong>.</span>
+          </li>
+          <li class="step-item">
+            <span class="step-number">3</span>
+            <span>Paste the generated URL above and confirm.</span>
+          </li>
+        </ul>
       </div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>Active Protocol Endpoints</h2>
-      <ul class="endpoint-list">
-        <li class="endpoint-item">
-          <div><span class="method">GET</span> <code>/manifest.json</code></div>
-          <div><a href="/manifest.json">Inspect Handshake</a></div>
-        </li>
-        <li class="endpoint-item">
-          <div><span class="method">GET</span> <code>/search?q={query}</code></div>
-          <div><a href="/search?q=Daft+Punk">Sample Query</a></div>
-        </li>
-        <li class="endpoint-item">
-          <div><span class="method">GET</span> <code>/health</code></div>
-          <div><a href="/health">JSON Diagnostics</a></div>
-        </li>
-        <li class="endpoint-item">
-          <div><span class="method">GET</span> <code>/docs</code></div>
-          <div><a href="/docs">OpenAPI Documentation</a></div>
-        </li>
-      </ul>
-    </div>
+    <!-- Protocol Matrix -->
+    <section class="panel">
+      <h2 class="panel-title">Protocol Specification</h2>
+      <p class="panel-subtitle">Core REST endpoints exposed by this relay instance.</p>
 
-    <div class="callout">
-      <strong>BitChord Client Setup:</strong> In the BitChord Android application, navigate to <code>Settings &gt; Sources &gt; Add Source</code> and enter your public HTTPS URL.
-    </div>
+      <div class="protocol-table-wrapper">
+        <table class="protocol-table">
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Endpoint</th>
+              <th>Contract & Function</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="http-method">GET</span></td>
+              <td><code class="endpoint-code">/manifest.json</code></td>
+              <td>BitChord discovery handshake and capability declaration</td>
+            </tr>
+            <tr>
+              <td><span class="http-method">GET</span></td>
+              <td><code class="endpoint-code">/search?q={query}</code></td>
+              <td>Aggregated multi-provider catalog search with ranked results</td>
+            </tr>
+            <tr>
+              <td><span class="http-method">GET</span></td>
+              <td><code class="endpoint-code">/stream/{item_id}</code></td>
+              <td>Namespace-routed audio resolution with automated fallback</td>
+            </tr>
+            <tr>
+              <td><span class="http-method">GET</span></td>
+              <td><code class="endpoint-code">/audio/dz/{track_id}</code></td>
+              <td>Decrypted FLAC stream proxy supporting HTTP 206 range chunking</td>
+            </tr>
+            <tr>
+              <td><span class="http-method">GET</span></td>
+              <td><code class="endpoint-code">/health</code></td>
+              <td>JSON diagnostic probe reporting provider readiness</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      BitChord Homelab Addon // Built for Lossless Audiophile Streaming
+    </footer>
+
   </div>
+
+  <script>
+    (function() {
+      var tokenInput = document.getElementById('tokenInput');
+      var resultUrl = document.getElementById('resultUrl');
+      var copyBtn = document.getElementById('copyBtn');
+      var copyBtnText = document.getElementById('copyBtnText');
+
+      // Base host fallback
+      var baseHost = window.location.origin;
+
+      // Restore token from localStorage
+      var savedToken = localStorage.getItem('bitchord_user_token') || '';
+      if (savedToken) {
+        tokenInput.value = savedToken;
+      }
+
+      function updateUrl() {
+        var token = tokenInput.value.trim();
+        var url;
+        if (token) {
+          localStorage.setItem('bitchord_user_token', token);
+          url = baseHost + '/' + encodeURIComponent(token) + '/manifest.json';
+        } else {
+          localStorage.removeItem('bitchord_user_token');
+          url = baseHost + '/manifest.json';
+        }
+        resultUrl.textContent = url;
+      }
+
+      tokenInput.addEventListener('input', updateUrl);
+      updateUrl();
+
+      copyBtn.addEventListener('click', function() {
+        var textToCopy = resultUrl.textContent;
+        if (!navigator.clipboard) {
+          var ta = document.createElement('textarea');
+          ta.value = textToCopy;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        } else {
+          navigator.clipboard.writeText(textToCopy);
+        }
+
+        copyBtn.classList.add('copied');
+        copyBtnText.textContent = 'Copied!';
+        setTimeout(function() {
+          copyBtn.classList.remove('copied');
+          copyBtnText.textContent = 'Copy URL';
+        }, 2000);
+      });
+    })();
+  </script>
 </body>
 </html>

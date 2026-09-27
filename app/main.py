@@ -100,26 +100,40 @@ async def security_token_middleware(request: Request, call_next):
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(request: Request):
     """Interactive status landing page for homelab and portfolio display."""
     dz_configured = deezer.is_configured()
     td_configured = tidal.is_configured()
+
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+    public_host = settings.public_host or f"{proto}://{host}".rstrip("/")
 
     with open("app/templates/dashboard.html", "r", encoding="utf-8") as f:
         html = f.read()
 
     rendered = html.replace(
-        "{{dz_status_class}}", "dot-active" if dz_configured else "dot-idle"
+        "{{preferred_provider}}", settings.preferred_provider.upper()
     ).replace(
-        "{{dz_status_text}}", "Active & Ready" if dz_configured else "Awaiting ARL Token in .env"
+        "{{fallback_status}}", "Active (Deezer FLAC fallback)" if settings.enable_fallback else "Disabled"
     ).replace(
-        "{{dz_color}}", "#22c55e" if dz_configured else "#eab308"
+        "{{public_host}}", public_host
     ).replace(
-        "{{td_status_class}}", "dot-active" if td_configured else "dot-idle"
+        "{{dz_indicator_class}}", "indicator-active" if dz_configured else "indicator-idle"
     ).replace(
-        "{{td_status_text}}", "Active & Ready (HiFi/Lossless)" if td_configured else "Awaiting token.json (run python app/auth_tidal.py)"
+        "{{dz_status_label}}", "ONLINE" if dz_configured else "STANDBY"
     ).replace(
-        "{{td_color}}", "#22c55e" if td_configured else "#8b949e"
+        "{{dz_status_class}}", "status-active" if dz_configured else "status-idle"
+    ).replace(
+        "{{dz_status_text}}", "Active and operational" if dz_configured else "Awaiting DEEZER_ARL in environment"
+    ).replace(
+        "{{td_indicator_class}}", "indicator-active" if td_configured else "indicator-idle"
+    ).replace(
+        "{{td_status_label}}", "ONLINE" if td_configured else "STANDBY"
+    ).replace(
+        "{{td_status_class}}", "status-active" if td_configured else "status-idle"
+    ).replace(
+        "{{td_status_text}}", "Active and operational" if td_configured else "Awaiting token.json (run auth_tidal.py)"
     )
     return HTMLResponse(content=rendered)
 
