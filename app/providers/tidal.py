@@ -446,8 +446,9 @@ class TidalProvider(MusicProvider):
         clean_id = track_id.replace("td:", "")
         original_id = clean_id
 
-        # If lossless is requested, check LOSSLESS first for instant resolution
-        qualities_to_try = ["LOSSLESS", "HI_RES_LOSSLESS"] if quality == "lossless" else ["HI_RES_LOSSLESS", "LOSSLESS"]
+        # Prioritize HI_RES_LOSSLESS (24-bit Studio Master / Tidal Max) first,
+        # gracefully falling back to LOSSLESS (16-bit CD Quality FLAC)
+        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS"]
         data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
             logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
