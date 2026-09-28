@@ -1,4 +1,4 @@
-﻿services:
+services:
   unified-addon:
     build: .
     container_name: bitchord-unified-addon
@@ -14,12 +14,16 @@
       - PUBLIC_HOST=${PUBLIC_HOST:-https://addon.yourdomain.com}
       # Secret key protecting your endpoints from crawlers and bots
       - ACCESS_TOKEN=${ACCESS_TOKEN:-}
+      - AUDIO_SIGNING_SECRET=${AUDIO_SIGNING_SECRET:-}
       # Your Deezer ARL token (64 hexadecimal characters from browser cookies)
       - DEEZER_ARL=${DEEZER_ARL:-}
       # Native Tidal settings (credentials generated via: python app/auth_tidal.py)
       - TIDAL_TOKEN_FILE=/app/token.json
       - TIDAL_COUNTRY_CODE=${TIDAL_COUNTRY_CODE:-US}
+      - TIDAL_CLIENT_ID=${TIDAL_CLIENT_ID:-zU4XHVVkc2tDPo4t}
+      - TIDAL_CLIENT_SECRET=${TIDAL_CLIENT_SECRET:-VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=}
       # Priority: "tidal" or "deezer"
       - PREFERRED_PROVIDER=${PREFERRED_PROVIDER:-tidal}
       # Automatic cross-provider fallback if track is missing or fails on primary
       - ENABLE_FALLBACK=${ENABLE_FALLBACK:-true}
+      - DIAG_ENABLED=${DIAG_ENABLED:-false}
