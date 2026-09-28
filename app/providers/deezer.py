@@ -13,8 +13,8 @@ from app.crypto.deezer_cipher import (
 
 logger = logging.getLogger("bitchord.deezer")
 
-# Deezer license_token TTL is roughly 3 hours in practice; re-auth every 23h is conservative but safe
-_SESSION_TTL_SECONDS = 23 * 3600
+# Deezer's checkForm CSRF token expires in ~1-2h; refresh every hour to prevent silent 401s.
+_SESSION_TTL_SECONDS = 3600
 
 class DeezerProvider(MusicProvider):
     def __init__(self, arl: str, public_host: str):
@@ -66,11 +66,20 @@ class DeezerProvider(MusicProvider):
 
             user_id = user.get("USER_ID", 0)
             if user_id and user_id != 0:
+                if not self._license_token:
+                    logger.critical(
+                        "Deezer session has no license_token — ARL may be expired. "
+                        "Update DEEZER_ARL in your .env with a fresh cookie from browser."
+                    )
+                    return False
                 self._session_initialized_at = time.monotonic()
                 logger.info(f"Deezer authenticated as user ID {user_id}")
                 return True
 
-            logger.error("Deezer returned invalid user session for provided ARL")
+            logger.critical(
+                "Deezer returned USER_ID=0 — ARL cookie is expired or invalid. "
+                "Refresh DEEZER_ARL in your .env from browser DevTools → Application → Cookies → deezer.com."
+            )
             return False
         except Exception as exc:
             logger.error(f"Error during Deezer session initialization: {exc}")
@@ -210,15 +219,42 @@ class DeezerProvider(MusicProvider):
         if not await self._ensure_session():
             return None
 
-        url = f"https://www.deezer.com/ajax/gw-light.php?method=song.getData&api_version=1.0&api_token={self._api_token}"
-        cookies = {"arl": self.arl}
-        try:
-            resp = await self.client.post(url, cookies=cookies, json={"sng_id": track_id})
-            data = resp.json()
-            return data.get("results")
-        except Exception as exc:
-            logger.error(f"Failed to fetch song data for {track_id}: {exc}")
-            return None
+        for attempt in range(2):
+            url = f"https://www.deezer.com/ajax/gw-light.php?method=song.getData&api_version=1.0&api_token={self._api_token}"
+            cookies = {"arl": self.arl}
+            try:
+                resp = await self.client.post(url, cookies=cookies, json={"sng_id": track_id})
+                data = resp.json()
+
+                # Deezer returns HTTP 200 even on auth errors; must inspect the body
+                error = data.get("error")
+                if error:
+                    err_keys = list(error.keys()) if isinstance(error, dict) else [str(error)]
+                    logger.warning(
+                        f"Deezer song.getData error for {track_id} (attempt {attempt + 1}): {err_keys}"
+                    )
+                    if attempt == 0:
+                        # Force re-auth: stale api_token is the most common cause
+                        logger.info("Forcing Deezer session refresh after song.getData error")
+                        self._api_token = None
+                        self._license_token = None
+                        self._session_initialized_at = 0.0
+                        if not await self._init_session():
+                            return None
+                        continue  # retry with fresh token
+                    return None
+
+                results = data.get("results")
+                if not results:
+                    logger.warning(f"Deezer song.getData returned empty results for {track_id}")
+                    return None
+                return results
+
+            except Exception as exc:
+                logger.error(f"Failed to fetch song data for {track_id}: {exc}")
+                return None
+
+        return None
 
     async def get_cdn_url(self, track_id: str, quality: str = "lossless") -> tuple[str | None, str]:
         """Request media delivery stream URL from Deezer media API (cached for 2h)."""
@@ -235,7 +271,11 @@ class DeezerProvider(MusicProvider):
             return None, "flac"
 
         track_token = song_data.get("TRACK_TOKEN")
-        if not track_token or not self._license_token:
+        if not track_token:
+            logger.warning(f"Deezer track {track_id}: TRACK_TOKEN missing in song data (probable expired session or geo-block)")
+            return None, "flac"
+        if not self._license_token:
+            logger.warning(f"Deezer track {track_id}: license_token is absent — session may not have fully initialised")
             return None, "flac"
 
         url = "https://media.deezer.com/v1/get_url"
@@ -262,6 +302,10 @@ class DeezerProvider(MusicProvider):
             data = resp.json()
             media_list = data.get("data", [{}])[0].get("media", [])
             if not media_list:
+                logger.warning(
+                    f"Deezer track {track_id}: media.deezer.com returned no media entries "
+                    f"(errors: {data.get('errors', [])}). License token may be expired."
+                )
                 return None, "flac"
 
             first_media = media_list[0]
