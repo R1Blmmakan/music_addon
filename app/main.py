@@ -63,6 +63,39 @@ def _sign_result_url(result: dict) -> dict:
         return {**result, "url": f"{parsed.scheme}://{parsed.netloc}{signed_path}"}
     return result
 
+# ---------------------------------------------------------------------------
+# Auth failure rate limiter
+# ---------------------------------------------------------------------------
+_AUTH_FAIL_WINDOW = 60   # seconds
+_AUTH_FAIL_LIMIT  = 10   # max failures per window per IP
+_auth_fails: dict[str, list[float]] = {}
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP, preferring Cloudflare's header."""
+    return (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+
+def _auth_rate_ok(ip: str) -> bool:
+    """Return False when IP has exceeded the failure threshold."""
+    now = time.time()
+    window_start = now - _AUTH_FAIL_WINDOW
+    hits = [t for t in _auth_fails.get(ip, []) if t > window_start]
+    _auth_fails[ip] = hits
+    return len(hits) < _AUTH_FAIL_LIMIT
+
+def _record_auth_fail(ip: str) -> None:
+    now = time.time()
+    _auth_fails.setdefault(ip, []).append(now)
+    # Evict stale IPs so the dict doesn't grow forever on long-running containers
+    if len(_auth_fails) > 5000:
+        cutoff = now - _AUTH_FAIL_WINDOW
+        stale = [k for k, v in _auth_fails.items() if not v or max(v) < cutoff]
+        for k in stale:
+            _auth_fails.pop(k, None)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing configured music providers...")
@@ -104,6 +137,7 @@ async def security_token_middleware(request: Request, call_next):
     """
     token = settings.access_token
     path = request.url.path
+    ip = _client_ip(request)
 
     # /diag/* routes require DIAG_ENABLED=true: they proxy your Bearer token to Tidal
     if path.startswith("/diag/"):
@@ -112,7 +146,10 @@ async def security_token_middleware(request: Request, call_next):
                 status_code=403,
                 content={"error": "Diagnostic routes are disabled. Set DIAG_ENABLED=true in .env to enable."}
             )
-        if token and request.query_params.get("token") != token and request.headers.get("X-Access-Token") != token:
+        q_tok = request.query_params.get("token", "")
+        h_tok = request.headers.get("X-Access-Token", "")
+        if token and not (_hmac.compare_digest(q_tok, token) or _hmac.compare_digest(h_tok, token)):
+            _record_auth_fail(ip)
             return JSONResponse(status_code=401, content={"error": "Unauthorized."})
         return await call_next(request)
 
@@ -123,6 +160,14 @@ async def security_token_middleware(request: Request, call_next):
     if not token:
         return await call_next(request)
 
+    # Check rate limit before evaluating the token so brute-forcers get cut off fast
+    if not _auth_rate_ok(ip):
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(_AUTH_FAIL_WINDOW)},
+            content={"error": "Too many failed attempts. Try again later."},
+        )
+
     # Path-prefix token: https://host/{token}/manifest.json
     token_prefix = f"/{token}"
     if path == token_prefix or path.startswith(f"{token_prefix}/"):
@@ -132,12 +177,13 @@ async def security_token_middleware(request: Request, call_next):
         request.scope["path"] = stripped_path
         return await call_next(request)
 
-    if (
-        request.query_params.get("token") == token
-        or request.headers.get("X-Access-Token") == token
-    ):
+    # Constant-time comparison prevents timing oracle on query/header token
+    q_tok = request.query_params.get("token", "")
+    h_tok = request.headers.get("X-Access-Token", "")
+    if _hmac.compare_digest(q_tok, token) or _hmac.compare_digest(h_tok, token):
         return await call_next(request)
 
+    _record_auth_fail(ip)
     return JSONResponse(
         status_code=401,
         content={"error": "Unauthorized: valid access token required."}
