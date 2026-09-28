@@ -70,6 +70,12 @@ class TidalProvider(MusicProvider):
             try:
                 with open(self.token_file, "r", encoding="utf-8") as f:
                     self.token_data = json.load(f)
+                self._last_refresh_time = time.time()
+                logger.info(
+                    f"Loaded Tidal token file {self.token_file} "
+                    f"(client_id: {self.token_data.get('client_id')!r}, "
+                    f"user_id: {self.token_data.get('user_id')!r})"
+                )
             except Exception as e:
                 logger.error(f"Failed to read Tidal token file {self.token_file}: {e}")
                 self.token_data = None
@@ -110,7 +116,7 @@ class TidalProvider(MusicProvider):
                 "grant_type": "refresh_token",
                 "scope": "r_usr+w_usr+w_sub",
             }
-            if client_secret and client_id != "zU4XHVVkc2tDPo4t":
+            if client_secret:
                 data["client_secret"] = client_secret
 
             headers = {
@@ -120,6 +126,7 @@ class TidalProvider(MusicProvider):
                 "X-Tidal-Platform": "android",
             }
 
+            logger.info(f"Attempting Tidal token refresh: client_id={client_id!r}, has_secret={bool(client_secret)}")
             try:
                 resp = await self.client.post(TOKEN_URL, data=data, headers=headers)
                 if resp.status_code == 200:
@@ -203,11 +210,12 @@ class TidalProvider(MusicProvider):
                 try:
                     resp = await self.client.get(url, headers=self._auth_headers(), params=params)
                     if resp.status_code == 401:
-                        if await self._refresh_access_token():
-                            resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-                        else:
-                            logger.error("Tidal token refresh failed during search. Aborting search.")
-                            return []
+                        if time.time() - self._last_refresh_time > 60.0:
+                            if await self._refresh_access_token():
+                                resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                            else:
+                                logger.error("Tidal token refresh failed during search.")
+                                return []
 
                     if resp.status_code == 200:
                         data = resp.json()
@@ -376,6 +384,7 @@ class TidalProvider(MusicProvider):
             if fallback_cc not in countries:
                 countries.append(fallback_cc)
 
+        refresh_attempted = False
         for q in qualities:
             for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
                 for cc in countries:
@@ -389,11 +398,12 @@ class TidalProvider(MusicProvider):
                     try:
                         resp = await self.client.get(url, headers=self._auth_headers(), params=params)
                         if resp.status_code == 401:
-                            if await self._refresh_access_token():
-                                resp = await self.client.get(url, headers=self._auth_headers(), params=params)
-                            else:
-                                logger.error(f"Tidal token refresh failed. Aborting playback info fetch for {clean_id}.")
-                                return None
+                            logger.info(f"Tidal 401 on {endpoint} ({cc}, {q}): {resp.text[:120]}")
+                            # Only attempt refresh if token wasn't refreshed in last 60 seconds
+                            if not refresh_attempted and (time.time() - self._last_refresh_time > 60.0):
+                                refresh_attempted = True
+                                if await self._refresh_access_token():
+                                    resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
                         if resp.status_code == 429:
                             logger.warning(f"Tidal rate limit (429) on track {clean_id}. Retrying after 1.5s...")
@@ -402,8 +412,8 @@ class TidalProvider(MusicProvider):
 
                         if resp.status_code == 200:
                             return resp.json()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Exception fetching {url}: {e}")
         return None
 
     async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
