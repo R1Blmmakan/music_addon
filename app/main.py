@@ -1,7 +1,11 @@
 import re
 import base64
 import asyncio
+import hashlib
+import hmac as _hmac
 import logging
+import time
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, PlainTextResponse
@@ -16,7 +20,48 @@ logging.basicConfig(
 logger = logging.getLogger("bitchord.unified")
 
 deezer = DeezerProvider(settings.deezer_arl, settings.public_host)
-tidal = TidalProvider(settings.tidal_token_file, settings.tidal_country_code, settings.public_host)
+tidal = TidalProvider(
+    settings.tidal_token_file,
+    settings.tidal_country_code,
+    settings.public_host,
+    client_id=settings.tidal_client_id,
+    client_secret=settings.tidal_client_secret,
+)
+
+_AUDIO_TTL = 3600  # 1 hour: enough to cover any single playback session
+
+def _sign_path(path: str) -> str:
+    """Append exp + HMAC-SHA256 signature to a proxy path. No-op in open mode."""
+    secret = settings.audio_signing_secret or settings.access_token
+    if not secret:
+        return path
+    exp = int(time.time()) + _AUDIO_TTL
+    tag = _hmac.new(secret.encode(), f"{path}:{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{path}?exp={exp}&sig={tag}"
+
+def _verify_path_sig(path: str, exp: str | None, sig: str | None) -> bool:
+    """Verify HMAC-SHA256 on an internal proxy URL. Returns True in open mode."""
+    secret = settings.audio_signing_secret or settings.access_token
+    if not secret:
+        return True
+    if not exp or not sig:
+        return False
+    try:
+        if time.time() > float(exp):
+            return False
+    except ValueError:
+        return False
+    expected = _hmac.new(secret.encode(), f"{path}:{exp}".encode(), hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(expected, sig)
+
+def _sign_result_url(result: dict) -> dict:
+    """Sign /audio/ and /dash/ URLs in a stream result before sending to the client."""
+    url = result.get("url", "")
+    parsed = urlparse(url)
+    if parsed.path.startswith(("/audio/", "/dash/")):
+        signed_path = _sign_path(parsed.path)
+        return {**result, "url": f"{parsed.scheme}://{parsed.netloc}{signed_path}"}
+    return result
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,7 +116,7 @@ async def security_token_middleware(request: Request, call_next):
             return JSONResponse(status_code=401, content={"error": "Unauthorized."})
         return await call_next(request)
 
-    if path in ("/", "/robots.txt", "/favicon.ico", "/health") or path.startswith("/audio/") or path.startswith("/dash/"):
+    if path in ("/", "/robots.txt", "/favicon.ico", "/health"):
         return await call_next(request)
 
     # Open mode when no ACCESS_TOKEN configured
@@ -106,8 +151,10 @@ async def dashboard(request: Request):
     td_configured = tidal.is_configured()
 
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
-    public_host = settings.public_host or f"{proto}://{host}".rstrip("/")
+    raw_host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+    # Strip any injected paths or query strings from the host header
+    safe_netloc = urlparse(f"x://{raw_host}").netloc or raw_host.split("/")[0]
+    public_host = settings.public_host or f"{proto}://{safe_netloc}".rstrip("/")
 
     with open("app/templates/dashboard.html", "r", encoding="utf-8") as f:
         html = f.read()
@@ -213,6 +260,8 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
             _resolve_stream_inner(item_id, quality, dynamic_host, hint_title, hint_artist),
             timeout=7.0
         )
+        if isinstance(result, dict) and result.get("url"):
+            result = _sign_result_url(result)
         return result
     except asyncio.TimeoutError:
         logger.warning(f"Stream resolution timed out after 7s for {item_id}; returning 404 fast")
@@ -480,8 +529,10 @@ async def diag_tidal(track_id: str, country: str = ""):
     return out
 
 @app.get("/dash/td/{track_id}/init.mp4")
-async def serve_dash_init(track_id: str):
+async def serve_dash_init(track_id: str, request: Request):
     """Serve patched DASH fMP4 initialization segment with valid non-zero sampleRate for ExoPlayer."""
+    if not _verify_path_sig(request.url.path, request.query_params.get("exp"), request.query_params.get("sig")):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized."})
     clean_id = track_id.replace("td:", "").replace(".mpd", "").replace("/init.mp4", "")
     patched_init = tidal.init_segment_cache.get(clean_id)
     if not patched_init:
@@ -519,8 +570,11 @@ async def serve_dash_init(track_id: str):
     )
 
 @app.get("/dash/td/{track_id}")
-async def serve_dash_manifest(track_id: str):
+async def serve_dash_manifest(track_id: str, request: Request):
     """Serve decoded DASH MPD XML manifest for BitChord / ExoPlayer."""
+    if not _verify_path_sig(request.url.path, request.query_params.get("exp"), request.query_params.get("sig")):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized."})
+
     clean_id = track_id.replace("td:", "").replace(".mpd", "")
     manifest_xml = tidal.dash_cache.get(clean_id)
     if not manifest_xml:
@@ -530,11 +584,22 @@ async def serve_dash_manifest(track_id: str):
     if not manifest_xml:
         raise HTTPException(status_code=404, detail="DASH manifest not found")
 
+    # Re-sign the init segment URL embedded in the MPD so ExoPlayer can fetch it
+    init_pattern = re.compile(r'initialization="([^"]*?/dash/td/[^"]*?/init\.mp4)"')
+    def _re_sign_init(m: re.Match) -> str:
+        parsed_init = urlparse(m.group(1))
+        signed_path = _sign_path(parsed_init.path)
+        return f'initialization="{parsed_init.scheme}://{parsed_init.netloc}{signed_path}"'
+    manifest_xml = init_pattern.sub(_re_sign_init, manifest_xml)
+
     return Response(content=manifest_xml, media_type="application/dash+xml")
 
 @app.get("/audio/dz/{track_id}")
 async def stream_deezer_flac(track_id: str, request: Request):
     """Proxy encrypted Deezer CDN stream and decrypt chunks on the fly."""
+    if not _verify_path_sig(request.url.path, request.query_params.get("exp"), request.query_params.get("sig")):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized."})
+
     clean_id = track_id.replace("dz:", "").replace(".flac", "").replace(".mp3", "")
     range_header = request.headers.get("Range")
 
@@ -549,17 +614,5 @@ async def stream_deezer_flac(track_id: str, request: Request):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint for Docker and homelab status monitors."""
-    return {
-        "status": "healthy",
-        "providers": {
-            "deezer": {
-                "configured": deezer.is_configured(),
-                "ready": await deezer.health() if deezer.is_configured() else False
-            },
-            "tidal": {
-                "configured": tidal.is_configured(),
-                "ready": await tidal.health() if tidal.is_configured() else False
-            }
-        }
-    }
+    """Health check for Docker and load balancers."""
+    return {"status": "ok"}

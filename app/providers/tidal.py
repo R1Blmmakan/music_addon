@@ -42,11 +42,13 @@ class _LRUCache:
 
 
 class TidalProvider(MusicProvider):
-    def __init__(self, token_file: str = "token.json", country_code: str = "ID", public_host: str = ""):
+    def __init__(self, token_file: str = "token.json", country_code: str = "ID", public_host: str = "", client_id: str = "", client_secret: str = ""):
         self.token_file = Path(token_file)
         self.configured_country_code = country_code or "ID"
         self.country_code = self.configured_country_code
         self.public_host = public_host.rstrip("/") if public_host else ""
+        self.client_id = client_id
+        self.client_secret = client_secret
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
         # Capped at 256 entries each to prevent unbounded RAM growth on long-running containers
@@ -81,8 +83,11 @@ class TidalProvider(MusicProvider):
         if not self.token_data or not self.token_data.get("refresh_token"):
             return False
 
-        client_id = self.token_data.get("client_id", "zU4XHVVkc2tDPo4t")
-        client_secret = self.token_data.get("client_secret", "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=")
+        client_id = self.client_id or self.token_data.get("client_id", "")
+        client_secret = self.client_secret or self.token_data.get("client_secret", "")
+        if not client_id or not client_secret:
+            logger.error("Tidal token refresh failed: client credentials not configured. Set TIDAL_CLIENT_ID and TIDAL_CLIENT_SECRET in .env.")
+            return False
         refresh_token = self.token_data["refresh_token"]
 
         data = {

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tidal Device Authorization CLI
 Performs standard OAuth 2.0 Device Code pairing for Tidal accounts.
 Generates token.json for the native Tidal provider.
@@ -12,8 +12,8 @@ import webbrowser
 from pathlib import Path
 import httpx
 
-AUTH_CLIENT_ID = "zU4XHVVkc2tDPo4t"
-AUTH_CLIENT_SECRET = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4="
+AUTH_CLIENT_ID = os.getenv("TIDAL_CLIENT_ID", "zU4XHVVkc2tDPo4t")
+AUTH_CLIENT_SECRET = os.getenv("TIDAL_CLIENT_SECRET", "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=")
 DEVICE_AUTH_URL = "https://auth.tidal.com/v1/oauth2/device_authorization"
 TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 TOKEN_FILE = Path(os.getenv("TIDAL_TOKEN_FILE", Path(__file__).resolve().parent.parent / "token.json"))
