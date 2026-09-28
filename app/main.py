@@ -646,7 +646,9 @@ async def serve_dash_manifest(track_id: str, request: Request):
     def _re_sign_init(m: re.Match) -> str:
         parsed_init = urlparse(m.group(1))
         signed_path = _sign_path(parsed_init.path)
-        return f'initialization="{parsed_init.scheme}://{parsed_init.netloc}{signed_path}"'
+        # & must be &amp; inside XML attribute values; parsers unescape before fetching
+        signed_url = f"{parsed_init.scheme}://{parsed_init.netloc}{signed_path}".replace("&", "&amp;")
+        return f'initialization="{signed_url}"'
     manifest_xml = init_pattern.sub(_re_sign_init, manifest_xml)
 
     return Response(content=manifest_xml, media_type="application/dash+xml")
