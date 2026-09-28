@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 import httpx
@@ -51,6 +52,8 @@ class TidalProvider(MusicProvider):
         self.client_secret = client_secret
         self.client = httpx.AsyncClient(timeout=15.0)
         self.token_data: dict | None = None
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh_time: float = 0.0
         # Capped at 256 entries each to prevent unbounded RAM growth on long-running containers
         self.dash_cache: _LRUCache = _LRUCache(maxsize=256)
         self.init_url_cache: _LRUCache = _LRUCache(maxsize=256)
@@ -79,44 +82,64 @@ class TidalProvider(MusicProvider):
         return bool(self.token_data and self.token_data.get("access_token"))
 
     async def _refresh_access_token(self) -> bool:
-        """Refresh expired access token using stored refresh token."""
+        """Refresh expired access token using stored refresh token with concurrency protection."""
         if not self.token_data or not self.token_data.get("refresh_token"):
             return False
 
-        client_id = self.client_id or self.token_data.get("client_id", "")
-        client_secret = self.client_secret or self.token_data.get("client_secret", "")
-        if not client_id or not client_secret:
-            logger.error("Tidal token refresh failed: client credentials not configured. Set TIDAL_CLIENT_ID and TIDAL_CLIENT_SECRET in .env.")
-            return False
-        refresh_token = self.token_data["refresh_token"]
+        # Fast path: if another coroutine just refreshed within the last 10 seconds, reuse it
+        now = time.time()
+        if now - self._last_refresh_time < 10.0:
+            return True
 
-        data = {
-            "client_id": client_id,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-            "scope": "r_usr+w_usr+w_sub",
-        }
-        auth = (client_id, client_secret)
-
-        try:
-            resp = await self.client.post(TOKEN_URL, data=data, auth=auth)
-            if resp.status_code == 200:
-                new_info = resp.json()
-                self.token_data["access_token"] = new_info["access_token"]
-                if "refresh_token" in new_info:
-                    self.token_data["refresh_token"] = new_info["refresh_token"]
-
-                with open(self.token_file, "w", encoding="utf-8") as f:
-                    json.dump(self.token_data, f, indent=2)
-
-                logger.info("Successfully refreshed Tidal access token.")
+        async with self._refresh_lock:
+            # Re-check under lock in case another request completed refresh while we waited
+            now = time.time()
+            if now - self._last_refresh_time < 10.0:
                 return True
-            else:
-                logger.error(f"Tidal token refresh failed with HTTP {resp.status_code}: {resp.text}")
+
+            client_id = self.client_id or self.token_data.get("client_id", "")
+            client_secret = self.client_secret or self.token_data.get("client_secret", "")
+            if not client_id:
+                logger.error("Tidal token refresh failed: client_id not configured. Set TIDAL_CLIENT_ID in .env.")
                 return False
-        except Exception as exc:
-            logger.error(f"Exception during Tidal token refresh: {exc}")
-            return False
+            refresh_token = self.token_data["refresh_token"]
+
+            data = {
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+                "scope": "r_usr+w_usr+w_sub",
+            }
+            if client_secret and client_id != "zU4XHVVkc2tDPo4t":
+                data["client_secret"] = client_secret
+
+            headers = {
+                "User-Agent": "okhttp/5.3.2",
+                "Accept": "application/json",
+                "X-Platform": "android",
+                "X-Tidal-Platform": "android",
+            }
+
+            try:
+                resp = await self.client.post(TOKEN_URL, data=data, headers=headers)
+                if resp.status_code == 200:
+                    new_info = resp.json()
+                    self.token_data["access_token"] = new_info["access_token"]
+                    if "refresh_token" in new_info:
+                        self.token_data["refresh_token"] = new_info["refresh_token"]
+
+                    with open(self.token_file, "w", encoding="utf-8") as f:
+                        json.dump(self.token_data, f, indent=2)
+
+                    self._last_refresh_time = time.time()
+                    logger.info("Successfully refreshed Tidal access token.")
+                    return True
+                else:
+                    logger.error(f"Tidal token refresh failed with HTTP {resp.status_code}: {resp.text}")
+                    return False
+            except Exception as exc:
+                logger.error(f"Exception during Tidal token refresh: {exc}")
+                return False
 
     def _auth_headers(self) -> dict:
         access_token = self.token_data.get("access_token", "") if self.token_data else ""
@@ -182,6 +205,9 @@ class TidalProvider(MusicProvider):
                     if resp.status_code == 401:
                         if await self._refresh_access_token():
                             resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                        else:
+                            logger.error("Tidal token refresh failed during search. Aborting search.")
+                            return []
 
                     if resp.status_code == 200:
                         data = resp.json()
@@ -365,6 +391,9 @@ class TidalProvider(MusicProvider):
                         if resp.status_code == 401:
                             if await self._refresh_access_token():
                                 resp = await self.client.get(url, headers=self._auth_headers(), params=params)
+                            else:
+                                logger.error(f"Tidal token refresh failed. Aborting playback info fetch for {clean_id}.")
+                                return None
 
                         if resp.status_code == 429:
                             logger.warning(f"Tidal rate limit (429) on track {clean_id}. Retrying after 1.5s...")

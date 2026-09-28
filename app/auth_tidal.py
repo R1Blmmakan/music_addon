@@ -74,7 +74,8 @@ async def authenticate():
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "scope": "r_usr+w_usr+w_sub"
             }
-            basic_auth = (AUTH_CLIENT_ID, AUTH_CLIENT_SECRET)
+            if AUTH_CLIENT_SECRET and AUTH_CLIENT_ID != "zU4XHVVkc2tDPo4t":
+                token_payload["client_secret"] = AUTH_CLIENT_SECRET
 
             start_time = time.time()
             success = False
@@ -87,13 +88,18 @@ async def authenticate():
                 await asyncio.sleep(interval)
 
                 try:
-                    poll_resp = await client.post(TOKEN_URL, data=token_payload, auth=basic_auth)
+                    poll_resp = await client.post(TOKEN_URL, data=token_payload)
                     if poll_resp.status_code == 200:
                         token_info = poll_resp.json()
                         success = True
                         break
-                    
-                    poll_data = poll_resp.json()
+
+                    try:
+                        poll_data = poll_resp.json()
+                    except Exception:
+                        print(f"\n[!] Unexpected non-JSON response from Tidal ({poll_resp.status_code}): {poll_resp.text[:200]}")
+                        continue
+
                     err = poll_data.get("error", "")
 
                     if err == "authorization_pending":

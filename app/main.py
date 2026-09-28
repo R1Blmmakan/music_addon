@@ -304,8 +304,9 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
     quality = "lossless"
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
-    dynamic_host = f"{proto}://{host}".rstrip("/")
+    raw_host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+    safe_netloc = urlparse(f"x://{raw_host}").netloc or raw_host.split("/")[0]
+    dynamic_host = settings.public_host or f"{proto}://{safe_netloc}".rstrip("/")
 
     # BitChord sends title/artist as query params for the stream endpoint.
     # These are used as hints if Tidal metadata fetch fails (e.g. regional tracks).
@@ -632,10 +633,15 @@ async def serve_dash_manifest(track_id: str, request: Request):
     if not _verify_path_sig(request.url.path, request.query_params.get("exp"), request.query_params.get("sig")):
         return JSONResponse(status_code=401, content={"error": "Unauthorized."})
 
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    raw_host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
+    safe_netloc = urlparse(f"x://{raw_host}").netloc or raw_host.split("/")[0]
+    base_origin = settings.public_host or f"{proto}://{safe_netloc}".rstrip("/")
+
     clean_id = track_id.replace("td:", "").replace(".mpd", "")
     manifest_xml = tidal.dash_cache.get(clean_id)
     if not manifest_xml:
-        await tidal.get_stream(clean_id)
+        await tidal.get_stream(clean_id, public_host=base_origin)
         manifest_xml = tidal.dash_cache.get(clean_id)
 
     if not manifest_xml:
@@ -646,8 +652,9 @@ async def serve_dash_manifest(track_id: str, request: Request):
     def _re_sign_init(m: re.Match) -> str:
         parsed_init = urlparse(m.group(1))
         signed_path = _sign_path(parsed_init.path)
+        origin = f"{parsed_init.scheme}://{parsed_init.netloc}" if parsed_init.netloc else base_origin
         # & must be &amp; inside XML attribute values; parsers unescape before fetching
-        signed_url = f"{parsed_init.scheme}://{parsed_init.netloc}{signed_path}".replace("&", "&amp;")
+        signed_url = f"{origin}{signed_path}".replace("&", "&amp;")
         return f'initialization="{signed_url}"'
     manifest_xml = init_pattern.sub(_re_sign_init, manifest_xml)
 
