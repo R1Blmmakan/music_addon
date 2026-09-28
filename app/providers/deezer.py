@@ -353,68 +353,105 @@ class DeezerProvider(MusicProvider):
         track_id: str,
         range_header: str | None = None
     ) -> tuple[AsyncGenerator[bytes, None], dict[str, str], int]:
-        """Fetch encrypted CDN stream, decrypt Blowfish chunks, and yield clean audio with byte-accurate Range support."""
+        """Fetch encrypted CDN stream, decrypt Blowfish chunks, and yield clean audio with byte-accurate Range support.
+
+        No HEAD pre-flight: the CDN GET response itself carries Content-Length and
+        Content-Range, so we let it drive sizing. This eliminates a blocking round-trip
+        before the first audio byte and prevents the "stuck at upgrading quality" stall
+        that occurs when HEAD returns no Content-Length and end_chunk is miscalculated.
+        """
         cdn_url, audio_format = await self.get_cdn_url(track_id)
         if not cdn_url:
             raise RuntimeError(f"Unable to retrieve stream CDN URL for track {track_id}")
 
         key = get_track_blowfish_key(track_id)
 
-        head_resp = await self.client.head(cdn_url)
-        total_size = int(head_resp.headers.get("Content-Length", 0))
+        # Build CDN request headers from the client Range header (chunk-aligned).
+        cdn_req_headers: dict[str, str] = {}
+        client_start = 0
 
         if range_header:
             m = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
             if m:
+                client_start = int(m.group(1))
+                client_end_str = m.group(2)
+                # Align start to Blowfish chunk boundary so decryption is correct.
+                start_chunk = client_start // CHUNK_SIZE
+                aligned_start = start_chunk * CHUNK_SIZE
+                if client_end_str:
+                    client_end = int(client_end_str)
+                    end_chunk = client_end // CHUNK_SIZE
+                    aligned_end = (end_chunk + 1) * CHUNK_SIZE - 1
+                    cdn_req_headers["Range"] = f"bytes={aligned_start}-{aligned_end}"
+                else:
+                    cdn_req_headers["Range"] = f"bytes={aligned_start}-"
+            else:
+                start_chunk = 0
+                aligned_start = 0
+        else:
+            start_chunk = 0
+            aligned_start = 0
+
+        # One network call: GET with optional Range. CDN responds with 200 or 206.
+        cdn_resp = await self.client.get(cdn_url, headers=cdn_req_headers)
+
+        cdn_status = cdn_resp.status_code
+        cdn_cl = cdn_resp.headers.get("Content-Length")
+        cdn_cr = cdn_resp.headers.get("Content-Range")  # e.g. "bytes 0-N/Total"
+
+        # Derive total file size and byte window from CDN response headers.
+        total_size = 0
+        if cdn_cr:
+            m_cr = re.match(r"bytes \d+-\d+/(\d+)", cdn_cr)
+            if m_cr:
+                total_size = int(m_cr.group(1))
+        elif cdn_cl:
+            total_size = int(cdn_cl)
+
+        if range_header and cdn_status in (200, 206):
+            m = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
+            if m:
                 start = int(m.group(1))
-                end = int(m.group(2)) if m.group(2) else total_size - 1
+                raw_end = m.group(2)
+                end = int(raw_end) if raw_end else (total_size - 1 if total_size else 0)
+                if total_size and start >= total_size:
+                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+                if total_size:
+                    end = min(end, total_size - 1)
+                status_code = 206
+                content_length = end - start + 1
+                content_range = f"bytes {start}-{end}/{total_size if total_size else '*'}"
             else:
                 start = 0
-                end = total_size - 1
-
-            if total_size > 0 and start >= total_size:
-                raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-
-            if total_size > 0:
-                end = min(end, total_size - 1)
-
-            status_code = 206
-            content_length = end - start + 1
-            content_range = f"bytes {start}-{end}/{total_size if total_size > 0 else '*'}"
+                end = total_size - 1 if total_size else 0
+                status_code = 200
+                content_length = total_size or None
+                content_range = None
         else:
             start = 0
-            end = total_size - 1 if total_size > 0 else 0
+            end = total_size - 1 if total_size else 0
             status_code = 200
-            content_length = total_size if total_size > 0 else None
+            content_length = total_size or None
             content_range = None
 
-        start_chunk = start // CHUNK_SIZE
-        end_chunk = end // CHUNK_SIZE if total_size > 0 else start_chunk + 1
-        aligned_start = start_chunk * CHUNK_SIZE
-        aligned_end = min((end_chunk + 1) * CHUNK_SIZE - 1, total_size - 1) if total_size > 0 else None
-
-        req_headers = {}
-        if aligned_end is not None:
-            req_headers["Range"] = f"bytes={aligned_start}-{aligned_end}"
-        elif aligned_start > 0:
-            req_headers["Range"] = f"bytes={aligned_start}-"
-
-        cdn_resp = await self.client.get(cdn_url, headers=req_headers)
-
-        response_headers = {
+        response_headers: dict[str, str] = {
             "Content-Type": "audio/flac" if audio_format == "flac" else "audio/mpeg",
             "Accept-Ranges": "bytes",
         }
         if content_length is not None:
             response_headers["Content-Length"] = str(content_length)
+        else:
+            response_headers["Transfer-Encoding"] = "chunked"
         if content_range is not None:
             response_headers["Content-Range"] = content_range
+
+        prefix_to_skip = start - aligned_start
 
         async def audio_generator() -> AsyncGenerator[bytes, None]:
             chunk_idx = start_chunk
             buffer = bytearray()
-            prefix_to_skip = start - aligned_start
-            bytes_remaining = end - start + 1 if total_size > 0 else float("inf")
+            nonlocal prefix_to_skip
+            bytes_remaining: float = (end - start + 1) if total_size else float("inf")
 
             async for raw_bytes in cdn_resp.aiter_bytes(chunk_size=CHUNK_SIZE):
                 buffer.extend(raw_bytes)
@@ -433,19 +470,18 @@ class DeezerProvider(MusicProvider):
                         if prefix_to_skip >= len(decrypted):
                             prefix_to_skip -= len(decrypted)
                             continue
-                        else:
-                            decrypted = decrypted[prefix_to_skip:]
-                            prefix_to_skip = 0
+                        decrypted = decrypted[prefix_to_skip:]
+                        prefix_to_skip = 0
 
-                    to_yield = decrypted[:bytes_remaining]
+                    to_yield = decrypted if bytes_remaining == float("inf") else decrypted[:int(bytes_remaining)]
                     bytes_remaining -= len(to_yield)
                     yield to_yield
 
+            # Flush tail (final partial chunk smaller than CHUNK_SIZE)
             if buffer and bytes_remaining > 0:
                 tail = bytes(buffer)
                 if prefix_to_skip > 0:
                     tail = tail[prefix_to_skip:]
-                to_yield = tail[:bytes_remaining]
-                yield to_yield
+                yield tail if bytes_remaining == float("inf") else tail[:int(bytes_remaining)]
 
         return audio_generator(), response_headers, status_code
