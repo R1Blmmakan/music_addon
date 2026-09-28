@@ -12,11 +12,12 @@ import webbrowser
 from pathlib import Path
 import httpx
 
-AUTH_CLIENT_ID = os.getenv("TIDAL_CLIENT_ID", "zU4XHVVkc2tDPo4t")
-AUTH_CLIENT_SECRET = os.getenv("TIDAL_CLIENT_SECRET", "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=")
+AUTH_CLIENT_ID = os.getenv("TIDAL_CLIENT_ID", "fX2JxdmntZWK0ixT")
+AUTH_CLIENT_SECRET = os.getenv("TIDAL_CLIENT_SECRET", "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=")
 DEVICE_AUTH_URL = "https://auth.tidal.com/v1/oauth2/device_authorization"
 TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
-TOKEN_FILE = Path(os.getenv("TIDAL_TOKEN_FILE", Path(__file__).resolve().parent.parent / "token.json"))
+default_token_path = Path(__file__).resolve().parent.parent / "data" / "token.json"
+TOKEN_FILE = Path(os.getenv("TIDAL_TOKEN_FILE", default_token_path))
 
 HEADERS = {
     "User-Agent": "okhttp/5.3.2",

@@ -6,7 +6,7 @@ services:
     ports:
       - "8100:8000"
     volumes:
-      - ./token.json:/app/token.json
+      - ./data:/app/data
       - ./app:/app/app
     environment:
       - PORT=8000
@@ -18,10 +18,10 @@ services:
       # Your Deezer ARL token (64 hexadecimal characters from browser cookies)
       - DEEZER_ARL=${DEEZER_ARL:-}
       # Native Tidal settings (credentials generated via: python app/auth_tidal.py)
-      - TIDAL_TOKEN_FILE=/app/token.json
+      - TIDAL_TOKEN_FILE=/app/data/token.json
       - TIDAL_COUNTRY_CODE=${TIDAL_COUNTRY_CODE:-US}
-      - TIDAL_CLIENT_ID=${TIDAL_CLIENT_ID:-zU4XHVVkc2tDPo4t}
-      - TIDAL_CLIENT_SECRET=${TIDAL_CLIENT_SECRET:-VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=}
+      - TIDAL_CLIENT_ID=${TIDAL_CLIENT_ID:-fX2JxdmntZWK0ixT}
+      - TIDAL_CLIENT_SECRET=${TIDAL_CLIENT_SECRET:-1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=}
       # Priority: "tidal" or "deezer"
       - PREFERRED_PROVIDER=${PREFERRED_PROVIDER:-tidal}
       # Automatic cross-provider fallback if track is missing or fails on primary

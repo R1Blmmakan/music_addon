@@ -9,12 +9,11 @@ class Settings(BaseModel):
     port: int = int(os.getenv("PORT", "8000"))
     public_host: str = os.getenv("PUBLIC_HOST", "http://localhost:8000").rstrip("/")
     deezer_arl: str = os.getenv("DEEZER_ARL", "").strip()
-    tidal_token_file: str = os.getenv("TIDAL_TOKEN_FILE", "token.json")
+    tidal_token_file: str = os.getenv("TIDAL_TOKEN_FILE", "data/token.json")
     tidal_country_code: str = os.getenv("TIDAL_COUNTRY_CODE", "ID")
-    # Tidal Android OAuth client credentials — move here from source so rotating them
-    # doesn't require a code change (update .env and restart).
-    tidal_client_id: str = os.getenv("TIDAL_CLIENT_ID", "zU4XHVVkc2tDPo4t")
-    tidal_client_secret: str = os.getenv("TIDAL_CLIENT_SECRET", "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=")
+    # Tidal Android/TV OAuth client credentials
+    tidal_client_id: str = os.getenv("TIDAL_CLIENT_ID", "fX2JxdmntZWK0ixT")
+    tidal_client_secret: str = os.getenv("TIDAL_CLIENT_SECRET", "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=")
     # "deezer" or "tidal" -- controls search result order and primary stream resolution
     preferred_provider: str = os.getenv("PREFERRED_PROVIDER", "tidal").lower()
     enable_fallback: bool = os.getenv("ENABLE_FALLBACK", "true").lower() in ("true", "1", "yes")

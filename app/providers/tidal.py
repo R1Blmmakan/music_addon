@@ -66,10 +66,23 @@ class TidalProvider(MusicProvider):
 
     def _load_token(self):
         """Load stored OAuth token from local disk."""
-        if self.token_file.exists():
+        if self.token_file.is_dir():
+            logger.error(f"Tidal token path {self.token_file} is a directory! A regular file was expected.")
+            self.token_data = None
+            return
+
+        target_file = self.token_file
+        if not target_file.exists():
+            # Fallback to root token.json if data/token.json does not exist yet
+            alt = target_file.parent.parent / "token.json"
+            if alt.is_file():
+                target_file = alt
+
+        if target_file.is_file():
             try:
-                with open(self.token_file, "r", encoding="utf-8") as f:
+                with open(target_file, "r", encoding="utf-8") as f:
                     self.token_data = json.load(f)
+                self.token_file = target_file
                 self._last_refresh_time = time.time()
                 logger.info(
                     f"Loaded Tidal token file {self.token_file} "
@@ -399,8 +412,17 @@ class TidalProvider(MusicProvider):
                         resp = await self.client.get(url, headers=self._auth_headers(), params=params)
                         if resp.status_code == 401:
                             logger.info(f"Tidal 401 on {endpoint} ({cc}, {q}): {resp.text[:120]}")
-                            # Only attempt refresh if token wasn't refreshed in last 60 seconds
-                            if not refresh_attempted and (time.time() - self._last_refresh_time > 60.0):
+                            # subStatus 4005 is "Asset is not ready for playback" (e.g. tier/region restriction),
+                            # NOT an expired OAuth access token. Do NOT trigger a token refresh on 4005.
+                            is_asset_unready = False
+                            try:
+                                err_json = resp.json()
+                                if err_json.get("subStatus") == 4005:
+                                    is_asset_unready = True
+                            except Exception:
+                                pass
+
+                            if not is_asset_unready and not refresh_attempted and (time.time() - self._last_refresh_time > 60.0):
                                 refresh_attempted = True
                                 if await self._refresh_access_token():
                                     resp = await self.client.get(url, headers=self._auth_headers(), params=params)
@@ -424,7 +446,9 @@ class TidalProvider(MusicProvider):
         clean_id = track_id.replace("td:", "")
         original_id = clean_id
 
-        data = await self._fetch_playback_info(clean_id, ["HI_RES_LOSSLESS", "LOSSLESS"])
+        # If lossless is requested, check LOSSLESS first for instant resolution
+        qualities_to_try = ["LOSSLESS", "HI_RES_LOSSLESS"] if quality == "lossless" else ["HI_RES_LOSSLESS", "LOSSLESS"]
+        data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
             logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
             return None
