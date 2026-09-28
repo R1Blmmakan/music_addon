@@ -160,6 +160,17 @@ async def security_token_middleware(request: Request, call_next):
     if not token:
         return await call_next(request)
 
+    # Audio/DASH proxy routes are authenticated by short-lived HMAC signature, not ACCESS_TOKEN.
+    # BitChord fetches these URLs directly using the signed URL returned from /stream/ —
+    # it never adds the path-prefix token on this second request.
+    if path.startswith(("/audio/", "/dash/")):
+        exp = request.query_params.get("exp")
+        sig = request.query_params.get("sig")
+        if not _verify_path_sig(path, exp, sig):
+            _record_auth_fail(ip)
+            return JSONResponse(status_code=401, content={"error": "Unauthorized."})
+        return await call_next(request)
+
     # Check rate limit before evaluating the token so brute-forcers get cut off fast
     if not _auth_rate_ok(ip):
         return JSONResponse(
