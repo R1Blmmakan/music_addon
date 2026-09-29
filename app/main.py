@@ -379,43 +379,38 @@ async def _resolve_stream_inner(
         content={"error": f"Track {item_id} is not available in lossless FLAC. Falling back to YouTube Music."}
     )
 
-def _clean_title_for_search(title: str, preserve_remix: bool = False) -> str:
-    """Strip collaborator and version suffixes from title for clean fallback search.
+def _clean_title_for_search(title: str, preserve_version: bool = False, preserve_remix: bool = False) -> str:
+    """Clean track title for fallback search across providers.
 
-    If preserve_remix is True, 'Remix' keywords are preserved.
-    If False, remixes and other version tags are stripped.
+    If preserve_version (or preserve_remix) is True, keeps version/remix/mix/feat suffixes
+    while stripping extraneous master metadata (e.g. Remastered, Explicit, Deluxe Edition).
+    If False, strips all version, collaborator, and remix suffixes down to canonical core song title.
     """
-    has_remix = bool(re.search(r'\b(?:remix|mix)\b', title, re.IGNORECASE))
+    keep_version = preserve_version or preserve_remix
 
-    # Remove feat./ft./with collaborator credits in parens or brackets
+    if keep_version:
+        cleaned = re.sub(
+            r'\s*[\(\[](?:remaster(?:ed)?(?:[^\)\]]*)?|deluxe(?: edition)?|bonus track|explicit|clean|anniversary(?:[^\)\]]*)?)[\)\]]',
+            '', title, flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r'\s*-\s*(?:remaster(?:ed)?(?: \d+)?|deluxe(?: edition)?|anniversary).*$',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+        return re.sub(r'\s+', ' ', cleaned).strip()
+
+    # Base canonical title cleaning: remove collaborator credits (feat/ft/with)
     cleaned = re.sub(r'\s*[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE)
-
-    if preserve_remix and has_remix:
-        # Keep remix indicator, remove other fluff
-        cleaned = re.sub(
-            r'\s*[\(\[](?:radio edit|extended|extended mix|single version|album version|'
-            r'live(?: at [^\)\]]*)?|remaster(?:ed)?(?:[^\]\)]*)?|acoustic|instrumental|clean|explicit|'
-            r'deluxe(?: edition)?|bonus track)[\)\]]',
-            '', cleaned, flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r'\s*-\s*(?:radio edit|extended mix|single version|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
-            '', cleaned, flags=re.IGNORECASE,
-        )
-    else:
-        # Strip all version and remix suffixes
-        cleaned = re.sub(
-            r'\s*[\(\[](?:radio edit|extended|extended mix|single version|album version|'
-            r'remix|mix|dub|edit|'
-            r'live(?: at [^\)\]]*)?|remaster(?:ed)?(?:[^\)\]]*)?|acoustic|instrumental|clean|explicit|'
-            r'deluxe(?: edition)?|bonus track)[\)\]]',
-            '', cleaned, flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(
-            r'\s*-\s*(?:radio edit|extended mix|single version|remix|mix|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
-            '', cleaned, flags=re.IGNORECASE,
-        )
-    return cleaned.strip()
+    # Strip all version, mix, edit, and edition suffixes
+    cleaned = re.sub(
+        r'\s*[\(\[][^\)\]]*(?:remix|mix|dub|edit|version|live|acoustic|instrumental|clean|explicit|deluxe|bonus|remaster)[^\)\]]*[\)\]]',
+        '', cleaned, flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r'\s*-\s*(?:radio edit|extended mix|single version|solo version|remix|mix|dub|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
+        '', cleaned, flags=re.IGNORECASE,
+    )
+    return re.sub(r'\s+', ' ', cleaned).strip()
 
 
 async def _tidal_to_deezer_fallback(
@@ -426,21 +421,19 @@ async def _tidal_to_deezer_fallback(
 ) -> dict | None:
     """Search Deezer by track title+artist for a Tidal track that failed to resolve.
 
-    If hint_title and hint_artist are provided (from request query params), we bypass
-    the Tidal metadata API round-trip entirely, shaving ~350ms off fallback latency.
-    Otherwise, we fetch metadata from Tidal.
+    Preserves mix, version, and featuring details so the exact version chosen by
+    the user is resolved on Deezer. Falls back to base canonical search only if
+    the version-specific match is unavailable.
     """
     clean_id = item_id.replace("td:", "")
-    query = ""
+    target_title = ""
+    artist = ""
 
     # Short-circuit: if hints were provided by the caller, use them immediately
     if hint_title and hint_artist:
-        is_remix = "remix" in hint_title.lower()
-        clean = _clean_title_for_search(hint_title, preserve_remix=is_remix)
-        if is_remix and "remix" not in clean.lower():
-            clean = f"{clean} Remix"
-        query = f"{clean} {hint_artist}"
-        logger.debug(f"Direct hint query for Deezer fallback: {query!r}")
+        target_title = hint_title
+        artist = hint_artist
+        logger.debug(f"Direct hint metadata for Deezer fallback: title={target_title!r}, artist={artist!r}")
     else:
         from app.providers.tidal import API_BASE
         try:
@@ -451,41 +444,50 @@ async def _tidal_to_deezer_fallback(
             )
             if meta_resp.status_code == 200:
                 meta = meta_resp.json()
-                title = meta.get("title", "").strip()
-                version = (meta.get("version") or "").strip()
+                t_title = meta.get("title", "").strip()
+                t_version = (meta.get("version") or "").strip()
+                target_title = f"{t_title} ({t_version})" if t_version and t_version.lower() not in t_title.lower() else t_title
+
                 artists_list = [meta.get("artist", {}).get("name", "")]
                 for a in meta.get("artists", []):
                     a_name = a.get("name")
                     if a_name and a_name not in artists_list:
                         artists_list.append(a_name)
                 artist = ", ".join(artists_list).strip()
-                if title and artist:
-                    is_remix = "remix" in f"{title} {version}".lower()
-                    clean = _clean_title_for_search(title, preserve_remix=is_remix)
-                    if is_remix and "remix" not in clean.lower():
-                        clean = f"{clean} Remix"
-                    query = f"{clean} {artist}"
         except Exception as exc:
             logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
 
-    if not query:
-        logger.warning(f"No query available for Deezer fallback on {clean_id}")
+    if not target_title or not artist:
+        logger.warning(f"No title/artist available for Deezer fallback on {clean_id}")
         return None
 
-    clean_query = sanitize_search_query(query)
-    dz_matches = await deezer.search(clean_query, limit=3)
-    for match in dz_matches:
-        stream = await deezer.get_stream(match["id"], quality)
-        if stream and stream.get("url"):
-            logger.info(f"Deezer fallback resolved {clean_query!r} to {match['id']}")
-            return stream
+    # Two-tier resolution:
+    # Tier 1: Targeted search preserving mix / version / featuring
+    # Tier 2: Canonical base title search (only if Tier 1 yields no stream)
+    queries_to_try = []
+    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
+    if has_version_hint:
+        targeted_clean = _clean_title_for_search(target_title, preserve_version=True)
+        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {artist}"))
+
+    base_clean = _clean_title_for_search(target_title, preserve_version=False)
+    base_query = sanitize_search_query(f"{base_clean} {artist}")
+    if base_query not in queries_to_try:
+        queries_to_try.append(base_query)
+
+    for q in queries_to_try:
+        logger.debug(f"Attempting Deezer fallback with query: {q!r}")
+        dz_matches = await deezer.search(q, limit=3)
+        for match in dz_matches:
+            stream = await deezer.get_stream(match["id"], quality)
+            if stream and stream.get("url"):
+                logger.info(f"Deezer fallback resolved {q!r} to {match['id']}")
+                return stream
+
     return None
 
 async def _deezer_to_tidal_fallback(item_id: str, quality: str, dynamic_host: str) -> dict | None:
-    """Fetch track title+artist from Deezer public API, then search Tidal for cross-provider fallback.
-
-    Same issue as Tidal-to-Deezer: searching by raw numeric ID returns garbage.
-    """
+    """Fetch track title+artist from Deezer public API, then search Tidal for cross-provider fallback."""
     clean_id = item_id.replace("dz:", "")
     try:
         meta_resp = await deezer.client.get(f"https://api.deezer.com/track/{clean_id}")
@@ -493,20 +495,35 @@ async def _deezer_to_tidal_fallback(item_id: str, quality: str, dynamic_host: st
             return None
         meta = meta_resp.json()
         title = meta.get("title", "").strip()
+        title_version = (meta.get("title_version") or "").strip()
+        target_title = f"{title} ({title_version})" if title_version and title_version.lower() not in title.lower() else title
         artist = meta.get("artist", {}).get("name", "").strip()
-        if not title or not artist:
+        if not target_title or not artist:
             return None
-        query = f"{title} {artist}"
     except Exception as exc:
         logger.warning(f"Could not fetch Deezer metadata for {clean_id}: {exc}")
         return None
 
-    td_matches = await tidal.search(query, limit=3)
-    for match in td_matches:
-        stream = await tidal.get_stream(match["id"], quality, public_host=dynamic_host)
-        if stream and stream.get("url"):
-            logger.info(f"Tidal fallback resolved '{query}' to {match['id']}")
-            return stream
+    queries_to_try = []
+    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
+    if has_version_hint:
+        targeted_clean = _clean_title_for_search(target_title, preserve_version=True)
+        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {artist}"))
+
+    base_clean = _clean_title_for_search(target_title, preserve_version=False)
+    base_query = sanitize_search_query(f"{base_clean} {artist}")
+    if base_query not in queries_to_try:
+        queries_to_try.append(base_query)
+
+    for q in queries_to_try:
+        logger.debug(f"Attempting Tidal fallback with query: {q!r}")
+        td_matches = await tidal.search(q, limit=3)
+        for match in td_matches:
+            stream = await tidal.get_stream(match["id"], quality, public_host=dynamic_host)
+            if stream and stream.get("url"):
+                logger.info(f"Tidal fallback resolved {q!r} to {match['id']}")
+                return stream
+
     return None
 
 @app.get("/diag/proxy")

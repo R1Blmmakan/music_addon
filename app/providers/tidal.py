@@ -243,10 +243,11 @@ class TidalProvider(MusicProvider):
                 return []
 
             query_lower = clean_query.lower()
+            version_keywords = ("remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft")
+            query_wants_version = any(re.search(r'\b' + re.escape(k) + r'\b', query_lower) for k in version_keywords)
             query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if w not in ("with", "feat", "ft")]
-            query_wants_remix = "remix" in query_lower
 
-            format_keywords = {"remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"}
+            format_keywords = set(version_keywords)
             artist_query_words = [w for w in query_words if w not in format_keywords]
 
             junk_keywords = (
@@ -263,9 +264,9 @@ class TidalProvider(MusicProvider):
 
                 raw_title = item.get("title", "").strip()
                 t_title = raw_title.lower()
-                t_version = (item.get("version") or "").strip()
+                t_version = (item.get("version") or "").strip().lower()
                 core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', t_title, flags=re.IGNORECASE).strip()
-                full_title = f"{t_title} {t_version.lower()}".strip()
+                full_title = f"{t_title} {t_version}".strip()
                 t_artist = item.get("artist", {}).get("name", "").strip().lower()
                 popularity = int(item.get("popularity", 0) or 0)
 
@@ -277,6 +278,7 @@ class TidalProvider(MusicProvider):
                 t_artists_str = " ".join(all_artists).strip().lower()
 
                 is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
+                has_version = bool(t_version) or is_remix
 
                 # Demote junk unless the query itself requests it
                 is_junk = any(
@@ -286,12 +288,15 @@ class TidalProvider(MusicProvider):
                 )
                 score = 1000 if is_junk else 0
 
-                # Strict remix permission gate
-                if query_wants_remix:
-                    if is_remix:
-                        score -= 500  # Priority bonus for remix
-                    else:
-                        score += 400  # Demote original when user specifically asked for remix
+                # Version & Remix Gate:
+                # If query specifically asks for a version/mix/remix/live/acoustic, reward the matching version!
+                # If query does NOT ask for a version, demote remixes so the canonical studio track is preferred.
+                if query_wants_version:
+                    matched_v_words = any(w in full_title for w in version_keywords if w in query_lower)
+                    if matched_v_words:
+                        score -= 500  # Priority bonus for matching requested version/mix
+                    elif not has_version:
+                        score += 300  # Demote plain track when user specifically asked for a version
                 else:
                     if is_remix:
                         score += 800  # Heavily demote remixes when user did not ask for remix
