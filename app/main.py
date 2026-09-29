@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.providers.deezer import DeezerProvider
 from app.providers.tidal import TidalProvider
-from app.schemas import ManifestResponse, SearchResponse, StreamResponse, TrackItem
+from app.schemas import ManifestResponse, SearchResponse, StreamResponse, TrackItem, ResolveIsrcResponse, ResolveResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,7 +279,7 @@ async def manifest():
         "name": "Homelab HiFi",
         "version": "2.2.0",
         "description": "Dual BitChord & Eclipse Music Lossless Addon",
-        "resources": ["search", "stream"],
+        "resources": ["search", "stream", "isrc", "resolve"],
         "types": ["track", "album", "artist"],
         "contentType": "music",
         "settings": [
@@ -430,6 +430,104 @@ async def search(q: str, quality: str = "lossless"):
 
     return {"tracks": combined, "results": combined}
 
+@app.get("/resolve-isrc", response_model=ResolveIsrcResponse)
+async def resolve_isrc(isrc: str):
+    """
+    Resolve recording by ISRC code conforming to Eclipse Music addon specification.
+    Allows Eclipse to query for an exact recording in ~150ms before fuzzy searching.
+    """
+    clean_isrc = isrc.strip().upper()
+    if not clean_isrc:
+        return JSONResponse(status_code=404, content={"trackId": None, "id": None})
+
+    # 1. Check Deezer ISRC (fastest: ~150ms, provides 100% progressive FLAC)
+    if deezer.is_configured():
+        try:
+            dz_url = f"https://api.deezer.com/track/isrc:{clean_isrc}"
+            resp = await deezer.client.get(dz_url, timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                dz_id = data.get("id")
+                if dz_id and not data.get("error"):
+                    track_id = f"dz:{dz_id}"
+                    logger.info(f"Resolved ISRC {clean_isrc} via Deezer -> {track_id}")
+                    return {"trackId": track_id, "id": track_id}
+        except Exception as e:
+            logger.warning(f"Deezer ISRC lookup error for {clean_isrc}: {e}")
+
+    # 2. Check Tidal ISRC
+    if tidal.is_configured():
+        try:
+            td_tracks = await tidal.search(f"isrc:{clean_isrc}", limit=3)
+            for t in td_tracks:
+                if (t.get("isrc") or "").upper() == clean_isrc:
+                    logger.info(f"Resolved ISRC {clean_isrc} via Tidal -> {t['id']}")
+                    return {"trackId": t["id"], "id": t["id"]}
+        except Exception as e:
+            logger.warning(f"Tidal ISRC lookup error for {clean_isrc}: {e}")
+
+    return JSONResponse(status_code=404, content={"trackId": None, "id": None})
+
+@app.get("/resolve", response_model=ResolveResponse)
+async def resolve(
+    title: str = "",
+    artist: str = "",
+    isrc: str | None = None,
+    durationMs: int | None = None
+):
+    """
+    Resolve recording identity for Eclipse Music generated queues, radio, and mix shelves.
+    """
+    # 1. Exact ISRC resolution when known
+    if isrc and isrc.strip():
+        clean_isrc = isrc.strip().upper()
+        if deezer.is_configured():
+            try:
+                dz_url = f"https://api.deezer.com/track/isrc:{clean_isrc}"
+                resp = await deezer.client.get(dz_url, timeout=3.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    dz_id = data.get("id")
+                    if dz_id and not data.get("error"):
+                        return {
+                            "item": {
+                                "id": f"dz:{dz_id}",
+                                "type": "track",
+                                "title": data.get("title", title),
+                                "artist": data.get("artist", {}).get("name", artist),
+                                "isrc": clean_isrc
+                            }
+                        }
+            except Exception as e:
+                logger.warning(f"Deezer resolve ISRC error for {clean_isrc}: {e}")
+
+    # 2. Multi-provider search and canonical ranking
+    q = f"{artist} {title}".strip()
+    query = sanitize_search_query(q)
+    if not query:
+        return {"item": None}
+
+    search_result = await search(q=query)
+    tracks = search_result.get("tracks", [])
+    if not tracks:
+        return {"item": None}
+
+    best = tracks[0]
+    best_isrc = getattr(best, "isrc", None) or (best.get("isrc") if isinstance(best, dict) else None)
+    best_id = getattr(best, "id", None) or (best.get("id") if isinstance(best, dict) else "")
+    best_title = getattr(best, "title", None) or (best.get("title") if isinstance(best, dict) else title)
+    best_artist = getattr(best, "artist", None) or (best.get("artist") if isinstance(best, dict) else artist)
+
+    return {
+        "item": {
+            "id": best_id,
+            "type": "track",
+            "title": best_title,
+            "artist": best_artist,
+            "isrc": best_isrc
+        }
+    }
+
 @app.get("/stream/{item_id}", response_model=StreamResponse)
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
@@ -487,13 +585,14 @@ async def _resolve_stream_inner(
 
         res = await tidal_task
         if res and res.get("url"):
-            # Apple AVPlayer does not support MPEG-DASH XML manifests natively.
-            # If the client is an Apple device and Tidal returned a DASH manifest,
-            # prefer progressive Deezer FLAC if available.
-            if is_apple_client and res.get("manifest") == "dash" and deezer_prefetch:
+            # Tidal DASH manifests require client-side demuxing and segment fetching from Tidal's CDN,
+            # which rejects cross-origin browser/player requests with 403 Forbidden.
+            # Apple AVPlayer, Web players, and non-BitChord players cannot play Tidal DASH manifests.
+            # Whenever Tidal returns DASH, prefer progressive Deezer FLAC if available.
+            if res.get("manifest") == "dash" and deezer_prefetch:
                 fallback_stream = await deezer_prefetch
                 if fallback_stream and fallback_stream.get("url"):
-                    logger.info(f"Apple client detected for Tidal DASH track {item_id}; delivering progressive Deezer FLAC")
+                    logger.info(f"Tidal track {item_id} returned DASH manifest; delivering progressive Deezer FLAC for universal player compatibility")
                     return fallback_stream
             elif deezer_prefetch:
                 deezer_prefetch.cancel()

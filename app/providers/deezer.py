@@ -216,7 +216,7 @@ class DeezerProvider(MusicProvider):
                     "title": dz_title,
                     "artist": item.get("artist", {}).get("name", ""),
                     "album": item.get("album", {}).get("title", ""),
-                    "duration": float(item.get("duration", 0)),
+                    "duration": int(round(float(item.get("duration", 0) or 0))),
                     "artworkURL": artwork,
                     "format": "flac",
                     "audioQuality": "LOSSLESS",

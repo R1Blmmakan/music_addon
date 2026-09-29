@@ -1,4 +1,4 @@
-﻿# Environment variables & secrets
+# Environment variables & secrets
 .env
 *.env
 token.json
@@ -30,3 +30,4 @@ Thumbs.db
 bitchord.apk
 *.log
 scratch_test*
+scratch/

@@ -394,7 +394,7 @@ class TidalProvider(MusicProvider):
                     "title": display_title,
                     "artist": display_artist,
                     "album": item.get("album", {}).get("title", ""),
-                    "duration": float(item.get("duration", 0)),
+                    "duration": int(round(float(item.get("duration", 0) or 0))),
                     "artwork": artwork,
                     "artworkURL": artwork,
                     "format": "flac",

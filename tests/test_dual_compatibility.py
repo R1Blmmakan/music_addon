@@ -95,3 +95,113 @@ class TestDualCompatibility(unittest.TestCase):
                 headers={"Origin": "https://eclipsemusic.app", "Access-Control-Request-Method": "GET"}
             )
             self.assertEqual(options_req.status_code, 200)
+
+    def test_resolve_isrc_endpoint(self):
+        """Test GET /resolve-isrc returns trackId conforming to Eclipse specification."""
+        from app.main import deezer
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": 3579685431, "title": "The Fate of Ophelia"}
+
+        with patch.object(deezer, "is_configured", return_value=True):
+            with patch.object(deezer.client, "get", return_value=mock_resp):
+                resp = self.client.get("/resolve-isrc?isrc=USUG12506436")
+                self.assertEqual(resp.status_code, 200)
+                data = resp.json()
+                self.assertIn("trackId", data)
+                self.assertIn("id", data)
+                self.assertEqual(data["trackId"], "dz:3579685431")
+
+        # Test with non-existent / empty ISRC
+        resp_404 = self.client.get("/resolve-isrc?isrc=")
+        self.assertEqual(resp_404.status_code, 404)
+
+    def test_resolve_endpoint(self):
+        """Test GET /resolve returns item dict for queue generation and autoplay."""
+        from app.main import deezer
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "id": 3579685431,
+            "title": "The Fate of Ophelia",
+            "artist": {"name": "Taylor Swift"}
+        }
+
+        with patch.object(deezer, "is_configured", return_value=True):
+            with patch.object(deezer.client, "get", return_value=mock_resp):
+                resp = self.client.get("/resolve?title=The+Fate+of+Ophelia&artist=Taylor+Swift&isrc=USUG12506436")
+                self.assertEqual(resp.status_code, 200)
+                data = resp.json()
+                self.assertIn("item", data)
+                self.assertIsNotNone(data["item"])
+                self.assertEqual(data["item"]["type"], "track")
+                self.assertEqual(data["item"]["id"], "dz:3579685431")
+
+    def test_track_duration_is_integer(self):
+        """Test that track duration is serialized as integer to prevent Dart int.tryParse() returning null."""
+        from app.main import deezer
+        mock_tracks = [{
+            "id": "dz:123456",
+            "title": "Test Song",
+            "artist": "Test Artist",
+            "album": "Test Album",
+            "duration": 226,
+            "artworkURL": "https://example.com/art.jpg",
+            "format": "flac",
+            "audioQuality": "LOSSLESS",
+            "bitrate": 1411,
+            "isrc": "US1234567890",
+        }]
+        with patch.object(deezer, "is_configured", return_value=True):
+            with patch.object(deezer, "search", return_value=mock_tracks):
+                resp = self.client.get("/search?q=Test+Song")
+                self.assertEqual(resp.status_code, 200)
+                tracks = resp.json().get("tracks", [])
+                if tracks:
+                    first = tracks[0]
+                    self.assertIsInstance(first["duration"], int)
+                    self.assertEqual(first["duration"], 226)
+
+    def test_dash_to_deezer_progressive_flac_fallback(self):
+        """When Tidal returns a DASH manifest, the server must deliver progressive Deezer FLAC."""
+        from app.main import _resolve_stream_inner, deezer, tidal
+        import asyncio
+
+        # Mock tidal.get_stream returning DASH manifest
+        mock_dash_res = {
+            "url": "https://api.r1fikri.dev/dash/td/463900374.mpd",
+            "format": "flac",
+            "codec": "flac",
+            "container": "fmp4",
+            "manifest": "dash",
+            "bitDepth": 24,
+            "sampleRate": 48000,
+            "bitrate": 1738,
+            "encrypted": False
+        }
+        mock_dz_res = {
+            "url": "https://api.r1fikri.dev/audio/dz/3579685431",
+            "format": "flac",
+            "codec": "flac",
+            "container": "flac",
+            "manifest": "none",
+            "bitDepth": 16,
+            "sampleRate": 44100,
+            "bitrate": 1411,
+            "encrypted": False
+        }
+
+        async def run_test():
+            with patch.object(deezer, "is_configured", return_value=True):
+                with patch.object(tidal, "get_stream", return_value=mock_dash_res):
+                    with patch("app.main._tidal_to_deezer_fallback", return_value=mock_dz_res):
+                        res = await _resolve_stream_inner(
+                            "td:463900374", "lossless", "https://api.r1fikri.dev", is_apple_client=False
+                        )
+                        # Even with is_apple_client=False, progressive FLAC should be delivered!
+                        self.assertEqual(res["manifest"], "none")
+                        self.assertEqual(res["container"], "flac")
+                        self.assertIn("/audio/dz/", res["url"])
+
+        asyncio.run(run_test())
+

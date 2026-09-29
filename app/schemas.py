@@ -15,7 +15,7 @@ class ManifestResponse(BaseModel):
     name: str = "Homelab HiFi"
     version: str = "2.2.0"
     description: str = "Dual BitChord & Eclipse Music Lossless Addon"
-    resources: list[str] = ["search", "stream"]
+    resources: list[str] = ["search", "stream", "isrc", "resolve"]
     # Eclipse Music required extensions
     types: list[str] = ["track", "album", "artist"]
     contentType: str = "music"
@@ -28,7 +28,7 @@ class TrackItem(BaseModel):
     title: str
     artist: str
     album: str = ""
-    duration: float = 0.0
+    duration: int = 0
     artworkURL: str | None = None
     artwork: str | None = None
     format: str = "flac"
@@ -36,6 +36,7 @@ class TrackItem(BaseModel):
     bitrate: int = 1411
     # Eclipse Music enrichment field (Apple Music / MusicKit linking)
     isrc: str | None = None
+    streamURL: str | None = None
     audioModes: list[str] = Field(default_factory=lambda: ["STEREO"])
     atmos: bool = False
 
@@ -45,6 +46,23 @@ class SearchResponse(BaseModel):
     """Dual envelope search response satisfying BitChord ('tracks') and Eclipse ('results')."""
     tracks: list[TrackItem]
     results: list[TrackItem]
+
+class ResolveIsrcResponse(BaseModel):
+    """ISRC resolution response conforming to Eclipse Music addon specification."""
+    trackId: str | None = None
+    id: str | None = None
+
+class ResolveItem(BaseModel):
+    """Item descriptor returned by Eclipse Music /resolve endpoint."""
+    id: str
+    type: str = "track"
+    title: str
+    artist: str
+    isrc: str | None = None
+
+class ResolveResponse(BaseModel):
+    """Response returned by Eclipse Music /resolve endpoint."""
+    item: ResolveItem | None = None
 
 class StreamResponse(BaseModel):
     """Stream URL and container specification for player engines."""
@@ -59,3 +77,4 @@ class StreamResponse(BaseModel):
     encrypted: bool = False
 
     model_config = {"extra": "allow"}
+
