@@ -264,12 +264,108 @@ async def manifest():
 
 def sanitize_search_query(query: str) -> str:
     """Normalize query strings to avoid search engine dead-ends with connector words."""
-    cleaned = re.sub(r'\s+(?:with|feat\.?|ft\.?|featuring)\s+', ' ', query.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r'[\(\[]\s*(?:feat|ft|with|featuring)\b\.?\s*([^\]\)]+)[\)\]]', r' \1 ', query.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r'\b(?:feat|ft|with|featuring)\b\.?', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'[\(\[]\s*[\)\]]', ' ', cleaned)
     return re.sub(r'\s+', ' ', cleaned).strip()
+
+def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
+    """Score track relevance to query for multi-provider interleaving and deduplication."""
+    q_lower = query.lower().strip()
+    q_clean = re.sub(r'[^\w\s]', ' ', q_lower)
+    q_words = [w for w in q_clean.split() if w]
+    if not q_words:
+        return 0.0
+
+    version_keywords = {"remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft"}
+    content_words = [w for w in q_words if w not in version_keywords]
+    format_query_words = [w for w in q_words if w in version_keywords]
+
+    title = track.get("title", "").strip().lower()
+    artist = track.get("artist", "").strip().lower()
+    core_title = re.sub(r'[\(\[][^\)\]]*[\)\]]', '', title).strip()
+
+    title_words = set(re.sub(r'[^\w\s]', ' ', title).split())
+    artist_words = set(re.sub(r'[^\w\s]', ' ', artist).split())
+
+    matched_title_content = sum(1 for w in content_words if w in title_words)
+    matched_artist_content = sum(1 for w in content_words if w in artist_words)
+
+    # Zero-relevance check: must match at least one content word if content_words exist
+    if content_words and matched_title_content == 0 and matched_artist_content == 0:
+        return -1.0
+
+    score = (matched_title_content * 40.0) + (matched_artist_content * 40.0)
+
+    # Whole title phrase match or starts-with bonus
+    if core_title == q_lower or title == q_lower:
+        score += 100.0
+    elif core_title in q_lower or q_lower.startswith(core_title):
+        score += 80.0
+
+    if artist and (artist in q_lower or q_lower.endswith(artist)):
+        score += 60.0
+
+    # Synergy: matches both title and artist
+    if matched_title_content > 0 and matched_artist_content > 0:
+        score += 80.0
+
+    # Specific version & mix alignment:
+    has_mix = any(k in title for k in ("remix", "mix", "dub", "edit", "version"))
+    wants_version = bool(format_query_words) or any(
+        w in ("tak", "tik", "alarm", "solo", "club", "reverk", "acoustic", "live") for w in q_words
+    )
+
+    if wants_version:
+        spec_matches = sum(1 for w in q_words if w in title_words)
+        score += spec_matches * 30.0
+        if not has_mix:
+            score -= 40.0
+    else:
+        if has_mix:
+            score -= 100.0
+
+    if is_preferred:
+        score += 5.0
+
+    return score
+
+def merge_and_rank_tracks(
+    tidal_tracks: list[dict],
+    deezer_tracks: list[dict],
+    query: str,
+    preferred_provider: str = "tidal"
+) -> list[dict]:
+    """Interleave and rank tracks from multiple providers based on relevance to query."""
+    scored_candidates = []
+    for t in tidal_tracks:
+        s = score_track_relevance(t, query, is_preferred=(preferred_provider == "tidal"))
+        if s > 0:
+            scored_candidates.append((s, "tidal", t))
+
+    for t in deezer_tracks:
+        s = score_track_relevance(t, query, is_preferred=(preferred_provider == "deezer"))
+        if s > 0:
+            scored_candidates.append((s, "deezer", t))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    seen_keys = set()
+    final_tracks = []
+    for s, prov, t in scored_candidates:
+        norm_title = re.sub(r'[^a-z0-9]', '', t.get("title", "").lower())
+        norm_artist = re.sub(r'[^a-z0-9]', '', t.get("artist", "").lower())
+        key = (norm_title, norm_artist)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        final_tracks.append(t)
+
+    return final_tracks
 
 @app.get("/search")
 async def search(q: str, quality: str = "lossless"):
-    """Multi-provider search aggregation respecting PREFERRED_PROVIDER order."""
+    """Multi-provider search aggregation respecting PREFERRED_PROVIDER order with relevance ranking."""
     query = sanitize_search_query(q)
     if not query:
         return {"tracks": []}
@@ -292,10 +388,12 @@ async def search(q: str, quality: str = "lossless"):
     tidal_tracks = results[0] if isinstance(results[0], list) else []
     deezer_tracks = results[1] if isinstance(results[1], list) else []
 
-    if settings.preferred_provider == "deezer":
-        combined = deezer_tracks + tidal_tracks
-    else:
-        combined = tidal_tracks + deezer_tracks
+    combined = merge_and_rank_tracks(
+        tidal_tracks=tidal_tracks,
+        deezer_tracks=deezer_tracks,
+        query=query,
+        preferred_provider=settings.preferred_provider
+    )
 
     return {"tracks": combined}
 

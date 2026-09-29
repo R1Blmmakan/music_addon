@@ -141,6 +141,13 @@ class DeezerProvider(MusicProvider):
                 is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
                 has_version = bool(title_version) or is_remix
 
+                # Zero-relevance check: candidate MUST match at least one non-format content word
+                if artist_q_words:
+                    has_title_match = any(w in core_title.split() for w in artist_q_words)
+                    has_artist_match = any(w in artist.split() for w in artist_q_words)
+                    if not has_title_match and not has_artist_match:
+                        continue
+
                 # Demote junk / karaoke
                 is_junk = any(k in full_title or k in artist for k in junk_keywords if k not in q_lower)
                 score = 1000 if is_junk else 0

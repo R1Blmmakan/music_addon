@@ -42,6 +42,119 @@ class _LRUCache:
         return key in self._store
 
 
+def score_tidal_candidate(item: dict, clean_query: str) -> float | None:
+    """Score a Tidal candidate item against clean_query. Returns None if candidate is irrelevant/junk."""
+    if item.get("type") == "video":
+        return None
+
+    raw_title = item.get("title", "").strip()
+    t_title = raw_title.lower()
+    t_version = (item.get("version") or "").strip().lower()
+    core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', t_title, flags=re.IGNORECASE).strip()
+    full_title = f"{t_title} {t_version}".strip()
+    popularity = int(item.get("popularity", 0) or 0)
+
+    all_artists = [item.get("artist", {}).get("name", "")]
+    for a in item.get("artists", []):
+        a_name = a.get("name")
+        if a_name and a_name not in all_artists:
+            all_artists.append(a_name)
+    t_artists_str = " ".join(all_artists).strip().lower()
+    t_album = item.get("album", {}).get("title", "").strip().lower()
+
+    query_lower = clean_query.lower()
+    version_keywords = ("remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft")
+    query_wants_version = any(re.search(r'\b' + re.escape(k) + r'\b', query_lower) for k in version_keywords)
+    query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if w not in ("with", "feat", "ft")]
+    format_keywords = set(version_keywords)
+    content_query_words = [w for w in query_words if w not in format_keywords]
+    artist_query_words = content_query_words
+
+    # Gate 1: Candidate MUST match at least one non-format content word in title or artist.
+    if content_query_words:
+        has_any_title = any(w in core_title.split() for w in content_query_words)
+        has_any_artist = any(w in t_artists_str.split() for w in content_query_words)
+        if not has_any_title and not has_any_artist:
+            return None
+
+    # Gate 2: Junk, parody, and tribute filtering
+    junk_keywords = (
+        "karaoke", "tribute", "originally performed",
+        "in the style of", "backing track", "piano tribute",
+        "lullaby", "instrumental", "cover", "speed up",
+        "sped up", "slowed", "acoustic tribute", "made famous by",
+        "party tyme", "sound-alike", "soundalike", "tribute band"
+    )
+    if any(k in full_title or k in t_artists_str or k in t_album for k in junk_keywords if k not in query_lower):
+        return None
+
+    # Gate 3: Compilation and parody bot checks
+    is_compilation = any(k in t_album for k in (
+        "summer hits", "hot hits", "top 50", "top 100", "various artists",
+        "best of 20", "party hits", "gym hits", "greatest hits 20"
+    ))
+    if is_compilation and len(content_query_words) >= 2:
+        matched_artist = sum(1 for w in content_query_words if w in t_artists_str.split())
+        matched_title = sum(1 for w in content_query_words if w in core_title.split())
+        if matched_title > 0 and matched_artist == 0:
+            return None
+        # Parody check: if candidate matches only partial artist words and is on a compilation
+        if matched_artist < 2 and any(w in content_query_words for w in ("clean", "dua", "blackpink", "orange", "lauv")):
+            return None
+
+    score = 0.0
+
+    # Version & Remix Gate:
+    is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
+    has_version = bool(t_version) or is_remix
+    if query_wants_version:
+        matched_v_words = any(w in full_title for w in version_keywords if w in query_lower)
+        if matched_v_words:
+            score -= 500.0  # Priority bonus for matching requested version/mix
+        elif not has_version:
+            score += 300.0  # Demote plain track when user specifically asked for a version
+    else:
+        if is_remix:
+            score += 800.0  # Heavily demote remixes when user did not ask for remix
+        elif not t_version:
+            score -= 200.0  # Bonus for canonical album track
+
+    # Title matching
+    if core_title == query_lower or full_title == query_lower:
+        score -= 800.0
+    elif core_title in query_lower or query_lower.startswith(core_title):
+        score -= 600.0
+    else:
+        matched_title_words = sum(1 for w in query_words if w in core_title.split() and w not in format_keywords)
+        score -= min(100.0 * matched_title_words, 350.0)
+        extra_words = sum(1 for w in core_title.split() if w not in query_words and w not in format_keywords)
+        score += 100.0 * extra_words
+
+    # Artist matching
+    matched_artist_words = sum(1 for w in artist_query_words if any(w == a_w for a_w in t_artists_str.split()))
+    if matched_artist_words > 0:
+        score -= 100.0 * matched_artist_words
+        if t_artists_str in query_lower or any(a.lower() in query_lower for a in all_artists):
+            score -= 200.0
+
+    # Synergy bonus when query words hit both title and artist
+    if len(query_words) >= 2 and artist_query_words:
+        has_title_match = any(w in core_title.split() for w in query_words if w not in format_keywords)
+        has_artist_match = any(w in t_artists_str.split() for w in artist_query_words)
+        if has_title_match and has_artist_match:
+            score -= 300.0
+
+    tags = item.get("mediaMetadata", {}).get("tags", [])
+    is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
+    if is_hi_res:
+        score -= 150.0
+    if "soundtrack" in t_album or "compilation" in t_album or is_compilation:
+        score += 350.0
+
+    score -= min(popularity, 100)
+    return score
+
+
 class TidalProvider(MusicProvider):
     def __init__(self, token_file: str = "token.json", country_code: str = "ID", public_host: str = "", client_id: str = "", client_secret: str = ""):
         self.token_file = Path(token_file)
@@ -242,102 +355,11 @@ class TidalProvider(MusicProvider):
             if not items:
                 return []
 
-            query_lower = clean_query.lower()
-            version_keywords = ("remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft")
-            query_wants_version = any(re.search(r'\b' + re.escape(k) + r'\b', query_lower) for k in version_keywords)
-            query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if w not in ("with", "feat", "ft")]
-
-            format_keywords = set(version_keywords)
-            artist_query_words = [w for w in query_words if w not in format_keywords]
-
-            junk_keywords = (
-                "karaoke", "tribute", "originally performed",
-                "in the style of", "backing track", "piano tribute",
-                "lullaby", "instrumental", "cover", "speed up",
-                "sped up", "slowed", "acoustic tribute", "made famous by"
-            )
-
             scored_items = []
             for idx, item in enumerate(items):
-                if item.get("type") == "video":
-                    continue
-
-                raw_title = item.get("title", "").strip()
-                t_title = raw_title.lower()
-                t_version = (item.get("version") or "").strip().lower()
-                core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', t_title, flags=re.IGNORECASE).strip()
-                full_title = f"{t_title} {t_version}".strip()
-                t_artist = item.get("artist", {}).get("name", "").strip().lower()
-                popularity = int(item.get("popularity", 0) or 0)
-
-                all_artists = [item.get("artist", {}).get("name", "")]
-                for a in item.get("artists", []):
-                    a_name = a.get("name")
-                    if a_name and a_name not in all_artists:
-                        all_artists.append(a_name)
-                t_artists_str = " ".join(all_artists).strip().lower()
-
-                is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
-                has_version = bool(t_version) or is_remix
-
-                # Demote junk unless the query itself requests it
-                is_junk = any(
-                    k in full_title or k in t_artists_str
-                    for k in junk_keywords
-                    if k not in query_lower
-                )
-                score = 1000 if is_junk else 0
-
-                # Version & Remix Gate:
-                # If query specifically asks for a version/mix/remix/live/acoustic, reward the matching version!
-                # If query does NOT ask for a version, demote remixes so the canonical studio track is preferred.
-                if query_wants_version:
-                    matched_v_words = any(w in full_title for w in version_keywords if w in query_lower)
-                    if matched_v_words:
-                        score -= 500  # Priority bonus for matching requested version/mix
-                    elif not has_version:
-                        score += 300  # Demote plain track when user specifically asked for a version
-                else:
-                    if is_remix:
-                        score += 800  # Heavily demote remixes when user did not ask for remix
-                    elif not t_version:
-                        score -= 200  # Bonus for canonical album track
-
-                # Title matching (using core_title without feat fluff)
-                if core_title == query_lower or full_title == query_lower:
-                    score -= 800
-                elif core_title in query_lower or query_lower.startswith(core_title):
-                    score -= 600
-                else:
-                    matched_title_words = sum(1 for w in query_words if w in core_title.split() and w not in format_keywords)
-                    score -= min(100 * matched_title_words, 350)
-                    extra_words = sum(1 for w in core_title.split() if w not in query_words and w not in format_keywords)
-                    score += 100 * extra_words
-
-                # Artist matching (ignoring format keywords so 'Remix Guys' don't get artist points)
-                matched_artist_words = sum(1 for w in artist_query_words if any(w == a_w for a_w in t_artists_str.split()))
-                if matched_artist_words > 0:
-                    score -= 100 * matched_artist_words
-                    if t_artists_str in query_lower or any(a.lower() in query_lower for a in all_artists):
-                        score -= 200
-
-                # Synergy bonus when query words hit both title and artist
-                if len(query_words) >= 2 and artist_query_words:
-                    has_title_match = any(w in core_title.split() for w in query_words if w not in format_keywords)
-                    has_artist_match = any(w in t_artists_str.split() for w in artist_query_words)
-                    if has_title_match and has_artist_match:
-                        score -= 300
-
-                t_album = item.get("album", {}).get("title", "").strip().lower()
-                tags = item.get("mediaMetadata", {}).get("tags", [])
-                is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
-                if is_hi_res:
-                    score -= 150
-                if "soundtrack" in t_album or "compilation" in t_album:
-                    score += 250
-
-                score -= min(popularity, 100)
-                scored_items.append((score, idx, item))
+                score = score_tidal_candidate(item, clean_query)
+                if score is not None:
+                    scored_items.append((score, idx, item))
 
             scored_items.sort(key=lambda x: (x[0], x[1]))
             best_items = [x[2] for x in scored_items]
