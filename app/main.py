@@ -9,9 +9,11 @@ from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.providers.deezer import DeezerProvider
 from app.providers.tidal import TidalProvider
+from app.schemas import ManifestResponse, SearchResponse, StreamResponse, TrackItem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,9 +121,17 @@ async def lifespan(app: FastAPI):
     await tidal.client.aclose()
 
 app = FastAPI(
-    title="BitChord Unified Lossless Addon",
-    version="2.1.0",
+    title="Unified Lossless Addon",
+    version="2.2.0",
     lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
@@ -132,12 +142,24 @@ async def robots():
 @app.middleware("http")
 async def security_token_middleware(request: Request, call_next):
     """
-    Validate path-based access token for BitChord and reject unauthorized callers.
-    BitChord natively supports URLs in the form: https://host/{token}/manifest.json.
+    Validate access token for BitChord and Eclipse Music and reject unauthorized callers.
+    Supports:
+    - CORS OPTIONS preflight: allowed without credentials per standard
+    - Path-based access token: https://host/{token}/manifest.json (BitChord format)
+    - Query parameter token: https://host/manifest.json?token={token} (Eclipse Music format)
+    - Headers: Authorization: Bearer {token} or X-Access-Token: {token}
     """
+    # W3C CORS preflight requests do not carry credentials/tokens; let OPTIONS pass to CORS middleware
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     token = settings.access_token
     path = request.url.path
     ip = _client_ip(request)
+
+    # Extract Bearer token safely if present
+    auth_header = request.headers.get("Authorization", "").strip()
+    bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
 
     # /diag/* routes require DIAG_ENABLED=true: they proxy your Bearer token to Tidal
     if path.startswith("/diag/"):
@@ -148,7 +170,11 @@ async def security_token_middleware(request: Request, call_next):
             )
         q_tok = request.query_params.get("token", "")
         h_tok = request.headers.get("X-Access-Token", "")
-        if token and not (_hmac.compare_digest(q_tok, token) or _hmac.compare_digest(h_tok, token)):
+        if token and not (
+            _hmac.compare_digest(q_tok, token)
+            or _hmac.compare_digest(h_tok, token)
+            or (bearer_token and _hmac.compare_digest(bearer_token, token))
+        ):
             _record_auth_fail(ip)
             return JSONResponse(status_code=401, content={"error": "Unauthorized."})
         return await call_next(request)
@@ -161,8 +187,8 @@ async def security_token_middleware(request: Request, call_next):
         return await call_next(request)
 
     # Audio/DASH proxy routes are authenticated by short-lived HMAC signature, not ACCESS_TOKEN.
-    # BitChord fetches these URLs directly using the signed URL returned from /stream/ —
-    # it never adds the path-prefix token on this second request.
+    # BitChord and Eclipse Music fetch these URLs directly using the signed URL returned from /stream/ —
+    # they do not add the path-prefix token on this second request.
     if path.startswith(("/audio/", "/dash/")):
         exp = request.query_params.get("exp")
         sig = request.query_params.get("sig")
@@ -188,10 +214,14 @@ async def security_token_middleware(request: Request, call_next):
         request.scope["path"] = stripped_path
         return await call_next(request)
 
-    # Constant-time comparison prevents timing oracle on query/header token
+    # Constant-time comparison prevents timing oracle on query/header/bearer token
     q_tok = request.query_params.get("token", "")
     h_tok = request.headers.get("X-Access-Token", "")
-    if _hmac.compare_digest(q_tok, token) or _hmac.compare_digest(h_tok, token):
+    if (
+        _hmac.compare_digest(q_tok, token)
+        or _hmac.compare_digest(h_tok, token)
+        or (bearer_token and _hmac.compare_digest(bearer_token, token))
+    ):
         return await call_next(request)
 
     _record_auth_fail(ip)
@@ -241,14 +271,17 @@ async def dashboard(request: Request):
     )
     return HTMLResponse(content=rendered)
 
-@app.get("/manifest.json")
+@app.get("/manifest.json", response_model=ManifestResponse)
 async def manifest():
-    """BitChord addon discovery contract."""
+    """Dual BitChord & Eclipse Music addon discovery contract."""
     return {
         "id": "unified-lossless-homelab",
         "name": "Homelab HiFi",
-        "version": "2.1.0",
+        "version": "2.2.0",
+        "description": "Dual BitChord & Eclipse Music Lossless Addon",
         "resources": ["search", "stream"],
+        "types": ["track", "album", "artist"],
+        "contentType": "music",
         "settings": [
             {
                 "key": "quality",
@@ -363,12 +396,12 @@ def merge_and_rank_tracks(
 
     return final_tracks
 
-@app.get("/search")
+@app.get("/search", response_model=SearchResponse)
 async def search(q: str, quality: str = "lossless"):
     """Multi-provider search aggregation respecting PREFERRED_PROVIDER order with relevance ranking."""
     query = sanitize_search_query(q)
     if not query:
-        return {"tracks": []}
+        return {"tracks": [], "results": []}
 
     tidal_limit = 15 if settings.preferred_provider == "tidal" else 8
     deezer_limit = 15 if settings.preferred_provider == "deezer" else 8
@@ -395,9 +428,9 @@ async def search(q: str, quality: str = "lossless"):
         preferred_provider=settings.preferred_provider
     )
 
-    return {"tracks": combined}
+    return {"tracks": combined, "results": combined}
 
-@app.get("/stream/{item_id}")
+@app.get("/stream/{item_id}", response_model=StreamResponse)
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
     quality = "lossless"
@@ -411,9 +444,13 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     hint_title = request.query_params.get("title", "").strip()
     hint_artist = request.query_params.get("artist", "").strip()
 
+    # Detect Apple clients (AVPlayer) which cannot decode MPEG-DASH XML manifests natively
+    ua = request.headers.get("user-agent", "").lower()
+    is_apple_client = any(k in ua for k in ("iphone", "ipad", "ipod", "applecoremedia", "cfnetwork"))
+
     try:
         result = await asyncio.wait_for(
-            _resolve_stream_inner(item_id, quality, dynamic_host, hint_title, hint_artist),
+            _resolve_stream_inner(item_id, quality, dynamic_host, hint_title, hint_artist, is_apple_client=is_apple_client),
             timeout=7.0
         )
         if isinstance(result, dict) and result.get("url"):
@@ -432,6 +469,7 @@ async def _resolve_stream_inner(
     dynamic_host: str,
     hint_title: str = "",
     hint_artist: str = "",
+    is_apple_client: bool = False,
 ):
     """Inner resolution logic, wrapped by resolve_stream with a hard 7s timeout."""
     if item_id.startswith("td:"):
@@ -449,7 +487,15 @@ async def _resolve_stream_inner(
 
         res = await tidal_task
         if res and res.get("url"):
-            if deezer_prefetch:
+            # Apple AVPlayer does not support MPEG-DASH XML manifests natively.
+            # If the client is an Apple device and Tidal returned a DASH manifest,
+            # prefer progressive Deezer FLAC if available.
+            if is_apple_client and res.get("manifest") == "dash" and deezer_prefetch:
+                fallback_stream = await deezer_prefetch
+                if fallback_stream and fallback_stream.get("url"):
+                    logger.info(f"Apple client detected for Tidal DASH track {item_id}; delivering progressive Deezer FLAC")
+                    return fallback_stream
+            elif deezer_prefetch:
                 deezer_prefetch.cancel()
             return res
 

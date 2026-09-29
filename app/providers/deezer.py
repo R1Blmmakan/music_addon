@@ -221,6 +221,7 @@ class DeezerProvider(MusicProvider):
                     "format": "flac",
                     "audioQuality": "LOSSLESS",
                     "bitrate": 1411,
+                    "isrc": item.get("isrc") or None,
                 })
             return tracks
         except Exception as exc:

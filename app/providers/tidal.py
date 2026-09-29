@@ -402,6 +402,7 @@ class TidalProvider(MusicProvider):
                     "bitrate": 9216 if is_hi_res else (1411 if is_lossless else 320),
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
+                    "isrc": item.get("isrc") or None,
                 })
                 if len(tracks) >= limit:
                     break
