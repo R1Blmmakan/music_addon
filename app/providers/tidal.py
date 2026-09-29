@@ -243,7 +243,7 @@ class TidalProvider(MusicProvider):
                 return []
 
             query_lower = clean_query.lower()
-            query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if len(w) > 1]
+            query_words = [w for w in re.sub(r'[^\w\s]', '', query_lower).split() if w not in ("with", "feat", "ft")]
             query_wants_remix = "remix" in query_lower
 
             format_keywords = {"remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"}
@@ -296,19 +296,18 @@ class TidalProvider(MusicProvider):
                     if is_remix:
                         score += 800  # Heavily demote remixes when user did not ask for remix
                     elif not t_version:
-                        score -= 300  # Bonus for canonical album track
+                        score -= 200  # Bonus for canonical album track
 
                 # Title matching (using core_title without feat fluff)
                 if core_title == query_lower or full_title == query_lower:
-                    score -= 600
+                    score -= 800
                 elif core_title in query_lower or query_lower.startswith(core_title):
-                    score -= 400
+                    score -= 600
                 else:
                     matched_title_words = sum(1 for w in query_words if w in core_title.split() and w not in format_keywords)
-                    if matched_title_words > 0:
-                        score -= 150 * matched_title_words
-                    else:
-                        score += 500  # Penalty for completely unrelated title
+                    score -= min(100 * matched_title_words, 350)
+                    extra_words = sum(1 for w in core_title.split() if w not in query_words and w not in format_keywords)
+                    score += 100 * extra_words
 
                 # Artist matching (ignoring format keywords so 'Remix Guys' don't get artist points)
                 matched_artist_words = sum(1 for w in artist_query_words if any(w == a_w for a_w in t_artists_str.split()))
@@ -322,7 +321,7 @@ class TidalProvider(MusicProvider):
                     has_title_match = any(w in core_title.split() for w in query_words if w not in format_keywords)
                     has_artist_match = any(w in t_artists_str.split() for w in artist_query_words)
                     if has_title_match and has_artist_match:
-                        score -= 400
+                        score -= 300
 
                 t_album = item.get("album", {}).get("title", "").strip().lower()
                 tags = item.get("mediaMetadata", {}).get("tags", [])

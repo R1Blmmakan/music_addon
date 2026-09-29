@@ -117,7 +117,7 @@ class DeezerProvider(MusicProvider):
 
             q_lower = clean_query.lower()
             query_wants_remix = "remix" in q_lower
-            q_words = [w for w in re.sub(r'[^\w\s]', '', q_lower).split() if len(w) > 1 and w not in ("with", "feat", "ft")]
+            q_words = [w for w in re.sub(r'[^\w\s]', '', q_lower).split() if w not in ("with", "feat", "ft")]
             format_keywords = {"remix", "mix", "edit", "version", "dub", "live", "acoustic", "instrumental"}
             artist_q_words = [w for w in q_words if w not in format_keywords]
 
@@ -153,23 +153,24 @@ class DeezerProvider(MusicProvider):
                     if is_remix:
                         score += 800  # Heavily demote remixes when user did not ask for remix
                     elif not title_version:
-                        score -= 300  # Bonus for canonical album track
+                        score -= 200  # Bonus for canonical album track
 
                 # Title matching (using core_title without feat fluff)
                 if core_title == q_lower or full_title == q_lower:
-                    score -= 600
+                    score -= 800
                 elif core_title in q_lower or q_lower.startswith(core_title):
-                    score -= 400
+                    score -= 600
                 else:
                     matched_title = sum(1 for w in q_words if w in core_title.split() and w not in format_keywords)
-                    if matched_title > 0:
-                        score -= 150 * matched_title
-                    else:
-                        score += 400  # Penalty for completely wrong title
+                    score -= min(100 * matched_title, 350)
+                    extra_words = sum(1 for w in core_title.split() if w not in q_words and w not in format_keywords)
+                    score += 100 * extra_words
 
                 # Artist matching (ignoring format keywords)
                 matched_artist = sum(1 for w in artist_q_words if w in artist.split())
                 score -= 100 * matched_artist
+                if artist in q_lower or any(a in q_lower for a in artist.split()):
+                    score -= 150
 
                 # Synergy bonus
                 if len(q_words) >= 2 and artist_q_words:
