@@ -162,12 +162,11 @@ class TestDualCompatibility(unittest.TestCase):
                     self.assertIsInstance(first["duration"], int)
                     self.assertEqual(first["duration"], 226)
 
-    def test_dash_to_deezer_progressive_flac_fallback(self):
-        """When Tidal returns a DASH manifest, the server must deliver progressive Deezer FLAC."""
+    def test_dash_delivers_native_dash_for_exoplayer_bitchord(self):
+        """When client supports DASH (BitChord / ExoPlayer), Tidal DASH manifest must be delivered natively."""
         from app.main import _resolve_stream_inner, deezer, tidal
         import asyncio
 
-        # Mock tidal.get_stream returning DASH manifest
         mock_dash_res = {
             "url": "https://api.r1fikri.dev/dash/td/463900374.mpd",
             "format": "flac",
@@ -196,12 +195,98 @@ class TestDualCompatibility(unittest.TestCase):
                 with patch.object(tidal, "get_stream", return_value=mock_dash_res):
                     with patch("app.main._tidal_to_deezer_fallback", return_value=mock_dz_res):
                         res = await _resolve_stream_inner(
-                            "td:463900374", "lossless", "https://api.r1fikri.dev", is_apple_client=False
+                            "td:463900374", "lossless", "https://api.r1fikri.dev", needs_progressive=False
                         )
-                        # Even with is_apple_client=False, progressive FLAC should be delivered!
+                        # ExoPlayer / BitChord must receive the native Tidal DASH stream
+                        self.assertEqual(res["manifest"], "dash")
+                        self.assertEqual(res["container"], "fmp4")
+                        self.assertIn("/dash/td/", res["url"])
+
+        asyncio.run(run_test())
+
+    def test_dash_to_deezer_progressive_flac_fallback_for_web_and_apple(self):
+        """When client requires progressive stream (Web / Apple AVPlayer), server delivers progressive Deezer FLAC."""
+        from app.main import _resolve_stream_inner, deezer, tidal
+        import asyncio
+
+        mock_dash_res = {
+            "url": "https://api.r1fikri.dev/dash/td/463900374.mpd",
+            "format": "flac",
+            "codec": "flac",
+            "container": "fmp4",
+            "manifest": "dash",
+            "bitDepth": 24,
+            "sampleRate": 48000,
+            "bitrate": 1738,
+            "encrypted": False
+        }
+        mock_dz_res = {
+            "url": "https://api.r1fikri.dev/audio/dz/3579685431",
+            "format": "flac",
+            "codec": "flac",
+            "container": "flac",
+            "manifest": "none",
+            "bitDepth": 16,
+            "sampleRate": 44100,
+            "bitrate": 1411,
+            "encrypted": False
+        }
+
+        async def run_test():
+            with patch.object(deezer, "is_configured", return_value=True):
+                with patch.object(tidal, "get_stream", return_value=mock_dash_res):
+                    with patch("app.main._tidal_to_deezer_fallback", return_value=mock_dz_res):
+                        res = await _resolve_stream_inner(
+                            "td:463900374", "lossless", "https://api.r1fikri.dev", needs_progressive=True
+                        )
+                        # Web and Apple clients must receive progressive Deezer FLAC
                         self.assertEqual(res["manifest"], "none")
                         self.assertEqual(res["container"], "flac")
                         self.assertIn("/audio/dz/", res["url"])
 
         asyncio.run(run_test())
+
+    def test_client_progressive_detection_rules(self):
+        """Verify _needs_progressive_stream correctly differentiates BitChord/ExoPlayer from Eclipse/Web/Apple."""
+        from app.main import _needs_progressive_stream
+        from starlette.requests import Request
+
+        def make_request(headers=None, query_string=""):
+            scope = {
+                "type": "http",
+                "method": "GET",
+                "path": "/stream/td:123",
+                "headers": [(k.lower().encode("latin1"), v.encode("latin1")) for k, v in (headers or {}).items()],
+                "query_string": query_string.encode("latin1"),
+            }
+            return Request(scope)
+
+        # BitChord / ExoPlayer Android client -> DASH capable (needs_progressive=False)
+        req_bitchord = make_request(headers={"User-Agent": "com.music.bitchord/1.0.0 (Android 14; Mobile)"})
+        self.assertFalse(_needs_progressive_stream(req_bitchord))
+
+        req_exoplayer = make_request(headers={"User-Agent": "AndroidXMedia3/1.11.0 (ExoPlayer)"})
+        self.assertFalse(_needs_progressive_stream(req_exoplayer))
+
+        req_okhttp = make_request(headers={"User-Agent": "okhttp/4.12.0"})
+        self.assertFalse(_needs_progressive_stream(req_okhttp))
+
+        # Apple AVPlayer / iOS -> needs progressive
+        req_apple = make_request(headers={"User-Agent": "AppleCoreMedia/1.0.0.21F79 (iPhone; U; CPU OS 17_5 like Mac OS X)"})
+        self.assertTrue(_needs_progressive_stream(req_apple))
+
+        # Eclipse Music Web client (carrying Origin) -> needs progressive
+        req_eclipse = make_request(headers={
+            "Origin": "https://eclipsemusic.app",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+        })
+        self.assertTrue(_needs_progressive_stream(req_eclipse))
+
+        # Explicit query param overrides
+        req_explicit_dash = make_request(query_string="prefer=dash", headers={"Origin": "https://eclipsemusic.app"})
+        self.assertFalse(_needs_progressive_stream(req_explicit_dash))
+
+        req_explicit_prog = make_request(query_string="prefer=progressive", headers={"User-Agent": "AndroidXMedia3/1.11.0"})
+        self.assertTrue(_needs_progressive_stream(req_explicit_prog))
+
 

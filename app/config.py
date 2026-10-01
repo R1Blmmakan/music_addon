@@ -17,6 +17,8 @@ class Settings(BaseModel):
     # "deezer" or "tidal" -- controls search result order and primary stream resolution
     preferred_provider: str = os.getenv("PREFERRED_PROVIDER", "tidal").lower()
     enable_fallback: bool = os.getenv("ENABLE_FALLBACK", "true").lower() in ("true", "1", "yes")
+    # "auto" (DASH for ExoPlayer/BitChord, progressive FLAC for Web/Apple), "always", or "never"
+    tidal_dash_fallback_to_deezer: str = os.getenv("TIDAL_DASH_FALLBACK_TO_DEEZER", "auto").lower()
     access_token: str = os.getenv("ACCESS_TOKEN", "").strip()
     # Separate HMAC secret for signing /audio/ and /dash/ proxy URLs.
     # Falls back to ACCESS_TOKEN when unset — set this only if you want

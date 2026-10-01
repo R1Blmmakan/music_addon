@@ -528,6 +528,67 @@ async def resolve(
         }
     }
 
+def _needs_progressive_stream(request: Request) -> bool:
+    """
+    Determine if the requesting client cannot play MPEG-DASH and requires
+    a progressive audio stream (such as Deezer FLAC).
+
+    Returns True for:
+      - Apple AVPlayer / iOS / macOS clients (AppleCoreMedia, CFNetwork, etc.)
+      - Web browser players (Origin / Referer present, or standard browser UA without ExoPlayer/BitChord)
+        because browser JS DASH players face cross-origin CORS 403 on Tidal CDN media segments.
+      - Explicit ?prefer=progressive or ?client=eclipse/web/apple query params.
+
+    Returns False for:
+      - BitChord mobile / ExoPlayer / AndroidX Media3 / OkHttp / Dart clients
+        which natively decode MPEG-DASH and have no browser CORS restrictions.
+      - Explicit ?prefer=dash or ?client=bitchord/exoplayer query params.
+    """
+    # 1. Explicit query parameter override
+    prefer = request.query_params.get("prefer", "").lower().strip()
+    if prefer in ("dash", "native", "direct"):
+        return False
+    if prefer in ("progressive", "flac", "deezer"):
+        return True
+
+    client = request.query_params.get("client", "").lower().strip()
+    if client in ("bitchord", "exoplayer", "media3", "android"):
+        return False
+    if client in ("eclipse", "web", "browser", "apple", "ios"):
+        return True
+
+    # 2. Config override
+    cfg_mode = getattr(settings, "tidal_dash_fallback_to_deezer", "auto").lower()
+    if cfg_mode == "always":
+        return True
+    if cfg_mode == "never":
+        return False
+
+    # 3. Header inspection
+    ua = request.headers.get("user-agent", "").lower()
+    origin = request.headers.get("origin", "").strip()
+    sec_fetch = request.headers.get("sec-fetch-mode", "").lower().strip()
+
+    # Apple AVPlayer cannot decode MPEG-DASH XML manifests
+    if any(k in ua for k in ("iphone", "ipad", "ipod", "applecoremedia", "cfnetwork")):
+        return True
+
+    # Web browser client (e.g. Eclipse Music web app)
+    # Browsers cannot fetch Tidal DASH media segments cross-origin (CORS 403)
+    if origin or sec_fetch == "cors":
+        return True
+
+    # Native BitChord / ExoPlayer / Media3 / OkHttp / Dart
+    if any(k in ua for k in ("exoplayer", "media3", "bitchord", "okhttp", "dalvik", "dart")):
+        return False
+
+    # General desktop/mobile browser UA check
+    if "mozilla" in ua and any(b in ua for b in ("chrome", "safari", "firefox", "edge")):
+        return True
+
+    # Default to native DASH for native clients
+    return False
+
 @app.get("/stream/{item_id}", response_model=StreamResponse)
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
@@ -542,13 +603,18 @@ async def resolve_stream(item_id: str, request: Request, quality: str = "lossles
     hint_title = request.query_params.get("title", "").strip()
     hint_artist = request.query_params.get("artist", "").strip()
 
-    # Detect Apple clients (AVPlayer) which cannot decode MPEG-DASH XML manifests natively
-    ua = request.headers.get("user-agent", "").lower()
-    is_apple_client = any(k in ua for k in ("iphone", "ipad", "ipod", "applecoremedia", "cfnetwork"))
+    needs_progressive = _needs_progressive_stream(request)
 
     try:
         result = await asyncio.wait_for(
-            _resolve_stream_inner(item_id, quality, dynamic_host, hint_title, hint_artist, is_apple_client=is_apple_client),
+            _resolve_stream_inner(
+                item_id,
+                quality,
+                dynamic_host,
+                hint_title,
+                hint_artist,
+                needs_progressive=needs_progressive,
+            ),
             timeout=7.0
         )
         if isinstance(result, dict) and result.get("url"):
@@ -567,9 +633,13 @@ async def _resolve_stream_inner(
     dynamic_host: str,
     hint_title: str = "",
     hint_artist: str = "",
-    is_apple_client: bool = False,
+    needs_progressive: bool = False,
+    is_apple_client: bool | None = None,
 ):
     """Inner resolution logic, wrapped by resolve_stream with a hard 7s timeout."""
+    if is_apple_client is not None:
+        needs_progressive = needs_progressive or is_apple_client
+
     if item_id.startswith("td:"):
         # Pre-launch Deezer fallback concurrently with tidal.get_stream().
         # Tidal now returns None fast for HIGH-only tracks, so Deezer result
@@ -585,14 +655,14 @@ async def _resolve_stream_inner(
 
         res = await tidal_task
         if res and res.get("url"):
-            # Tidal DASH manifests require client-side demuxing and segment fetching from Tidal's CDN,
-            # which rejects cross-origin browser/player requests with 403 Forbidden.
-            # Apple AVPlayer, Web players, and non-BitChord players cannot play Tidal DASH manifests.
-            # Whenever Tidal returns DASH, prefer progressive Deezer FLAC if available.
-            if res.get("manifest") == "dash" and deezer_prefetch:
+            # Tidal DASH manifests require client-side demuxing and segment fetching from Tidal's CDN.
+            # Apple AVPlayer cannot decode DASH manifests; Web browsers fail on cross-origin segment fetch (CORS 403).
+            # ExoPlayer / BitChord natively plays DASH via patched init segments.
+            # Only redirect to progressive Deezer FLAC if the client requires progressive audio.
+            if res.get("manifest") == "dash" and needs_progressive and deezer_prefetch:
                 fallback_stream = await deezer_prefetch
                 if fallback_stream and fallback_stream.get("url"):
-                    logger.info(f"Tidal track {item_id} returned DASH manifest; delivering progressive Deezer FLAC for universal player compatibility")
+                    logger.info(f"Tidal track {item_id} returned DASH manifest; delivering progressive Deezer FLAC for browser/Apple client compatibility")
                     return fallback_stream
             elif deezer_prefetch:
                 deezer_prefetch.cancel()
