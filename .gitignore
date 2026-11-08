@@ -28,6 +28,10 @@ Thumbs.db
 
 # App and debug files
 bitchord.apk
+BitChord-v*.apk
 *.log
 scratch_test*
 scratch/
+*.jpeg
+*.jpg
+*.png

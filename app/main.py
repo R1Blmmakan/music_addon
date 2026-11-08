@@ -62,7 +62,12 @@ def _sign_result_url(result: dict) -> dict:
     parsed = urlparse(url)
     if parsed.path.startswith(("/audio/", "/dash/")):
         signed_path = _sign_path(parsed.path)
-        return {**result, "url": f"{parsed.scheme}://{parsed.netloc}{signed_path}"}
+        # Preserve query parameters like quality=... alongside exp & sig
+        orig_params = [p for p in parsed.query.split("&") if p and not p.startswith(("exp=", "sig="))]
+        signed_params = signed_path.split("?", 1)[1] if "?" in signed_path else ""
+        all_params = "&".join(orig_params + ([signed_params] if signed_params else []))
+        signed_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{all_params}" if all_params else f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        return {**result, "url": signed_url}
     return result
 
 # ---------------------------------------------------------------------------
@@ -277,9 +282,12 @@ async def manifest():
     return {
         "id": "unified-lossless-homelab",
         "name": "Homelab HiFi",
-        "version": "2.2.0",
-        "description": "Dual BitChord & Eclipse Music Lossless Addon",
+        "version": "2.3.0",
+        "description": "Dual BitChord v1.9.1 & Eclipse Music Addon",
         "resources": ["search", "stream", "isrc", "resolve"],
+        "allowDownloads": True,
+        "checkValidLossless": True,
+        "bitchordAuth": False,
         "types": ["track", "album", "artist"],
         "contentType": "music",
         "settings": [
@@ -287,9 +295,9 @@ async def manifest():
                 "key": "quality",
                 "default": "lossless",
                 "options": [
-                    {"value": "lossless"},
-                    {"value": "high"},
-                    {"value": "low"}
+                    {"value": "lossless", "label": "Lossless (FLAC / Hi-Res)"},
+                    {"value": "high", "label": "High (320 kbps)"},
+                    {"value": "low", "label": "Low (128 kbps)"}
                 ]
             }
         ]
@@ -361,6 +369,22 @@ def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
     if is_preferred:
         score += 5.0
 
+    # Explicit vs Clean version preference:
+    is_explicit = bool(track.get("explicit", False))
+    clean_in_query = "clean" in q_words
+    is_clean_version = any(k in title for k in ("clean", "radio edit", "clean version"))
+
+    if not clean_in_query:
+        if is_explicit:
+            score += 40.0
+        if is_clean_version:
+            score -= 80.0
+    else:
+        if is_clean_version:
+            score += 60.0
+        if is_explicit:
+            score -= 80.0
+
     return score
 
 def merge_and_rank_tracks(
@@ -383,18 +407,31 @@ def merge_and_rank_tracks(
 
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
-    seen_keys = set()
-    final_tracks = []
+    clean_in_query = "clean" in query.lower().split()
+    seen_tracks: dict[tuple[str, str], tuple[float, dict]] = {}
+
     for s, prov, t in scored_candidates:
-        norm_title = re.sub(r'[^a-z0-9]', '', t.get("title", "").lower())
+        # Strip version annotations (clean, explicit, radio edit) to detect canonical track duplication
+        raw_t = t.get("title", "").lower()
+        core_t = re.sub(r'[\(\[][^\)\]]*(?:clean|explicit|radio edit|single version|album version)[^\)\]]*[\)\]]', '', raw_t)
+        core_t = re.sub(r'-\s*(?:clean|explicit|radio edit|single version|album version).*$', '', core_t)
+        norm_title = re.sub(r'[^a-z0-9]', '', core_t.strip())
         norm_artist = re.sub(r'[^a-z0-9]', '', t.get("artist", "").lower())
         key = (norm_title, norm_artist)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        final_tracks.append(t)
 
-    return final_tracks
+        if key not in seen_tracks:
+            seen_tracks[key] = (s, t)
+        else:
+            prev_s, prev_t = seen_tracks[key]
+            # When query does not specify 'clean', prioritize the explicit version
+            if not clean_in_query:
+                if t.get("explicit") and not prev_t.get("explicit"):
+                    seen_tracks[key] = (s, t)
+            else:
+                if not t.get("explicit") and prev_t.get("explicit"):
+                    seen_tracks[key] = (s, t)
+
+    return [t for _, t in seen_tracks.values()]
 
 @app.get("/search", response_model=SearchResponse)
 async def search(q: str, quality: str = "lossless"):
@@ -592,7 +629,8 @@ def _needs_progressive_stream(request: Request) -> bool:
 @app.get("/stream/{item_id}", response_model=StreamResponse)
 async def resolve_stream(item_id: str, request: Request, quality: str = "lossless"):
     """Resolve stream URL by namespace prefix with cross-provider fallback."""
-    quality = "lossless"
+    req_quality = request.query_params.get("quality", quality).lower().strip()
+    quality = req_quality if req_quality in ("lossless", "high", "low") else "lossless"
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     raw_host = request.headers.get("x-forwarded-host", request.headers.get("host", str(request.url.netloc)))
     safe_netloc = urlparse(f"x://{raw_host}").netloc or raw_host.split("/")[0]
@@ -991,16 +1029,18 @@ async def serve_dash_manifest(track_id: str, request: Request):
     return Response(content=manifest_xml, media_type="application/dash+xml")
 
 @app.get("/audio/dz/{track_id}")
-async def stream_deezer_flac(track_id: str, request: Request):
+async def stream_deezer_flac(track_id: str, request: Request, quality: str = "lossless"):
     """Proxy encrypted Deezer CDN stream and decrypt chunks on the fly."""
     if not _verify_path_sig(request.url.path, request.query_params.get("exp"), request.query_params.get("sig")):
         return JSONResponse(status_code=401, content={"error": "Unauthorized."})
 
     clean_id = track_id.replace("dz:", "").replace(".flac", "").replace(".mp3", "")
     range_header = request.headers.get("Range")
+    req_quality = request.query_params.get("quality", quality).lower().strip()
+    effective_quality = req_quality if req_quality in ("lossless", "high", "low") else "lossless"
 
     try:
-        audio_gen, headers, status = await deezer.stream_decrypted_audio(clean_id, range_header)
+        audio_gen, headers, status = await deezer.stream_decrypted_audio(clean_id, range_header, quality=effective_quality)
         return StreamingResponse(audio_gen, status_code=status, headers=headers)
     except HTTPException:
         raise

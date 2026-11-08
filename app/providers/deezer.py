@@ -193,6 +193,22 @@ class DeezerProvider(MusicProvider):
 
                 # Popularity rank bonus
                 score -= min(int(rank / 10000), 100)
+
+                # Explicit vs Clean version weighting:
+                is_explicit = bool(item.get("explicit_lyrics") or item.get("explicit_content_lyrics") == 1)
+                clean_in_query = bool(re.search(r'\bclean\b', q_lower))
+                is_clean_version = any(k in full_title for k in ("clean", "radio edit", "clean version"))
+                if not clean_in_query:
+                    if is_explicit:
+                        score -= 50
+                    if is_clean_version:
+                        score += 200
+                else:
+                    if is_clean_version:
+                        score -= 200
+                    if is_explicit:
+                        score += 300
+
                 scored.append((score, idx, item))
 
             scored.sort(key=lambda x: (x[0], x[1]))
@@ -211,6 +227,7 @@ class DeezerProvider(MusicProvider):
                 if t_ver and t_ver.lower() not in raw_t.lower():
                     dz_title = f"{raw_t} ({t_ver})".strip()
 
+                is_explicit = bool(item.get("explicit_lyrics") or item.get("explicit_content_lyrics") == 1)
                 tracks.append({
                     "id": f"dz:{item['id']}",
                     "title": dz_title,
@@ -222,6 +239,7 @@ class DeezerProvider(MusicProvider):
                     "audioQuality": "LOSSLESS",
                     "bitrate": 1411,
                     "isrc": item.get("isrc") or None,
+                    "explicit": is_explicit,
                 })
             return tracks
         except Exception as exc:
@@ -302,6 +320,13 @@ class DeezerProvider(MusicProvider):
         if quality.lower() in ("high", "320"):
             requested_formats = [
                 {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"},
+                {"cipher": "BF_CBC_STRIPE", "format": "MP3_128"},
+                {"cipher": "BF_CBC_STRIPE", "format": "FLAC"},
+            ]
+        elif quality.lower() in ("low", "128"):
+            requested_formats = [
+                {"cipher": "BF_CBC_STRIPE", "format": "MP3_128"},
+                {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"},
                 {"cipher": "BF_CBC_STRIPE", "format": "FLAC"},
             ]
 
@@ -342,30 +367,37 @@ class DeezerProvider(MusicProvider):
     async def get_stream(self, track_id: str, quality: str = "lossless") -> dict | None:
         """Return BitChord stream response pointing to internal decrypt proxy."""
         clean_id = track_id.replace("dz:", "")
-        cdn_url, audio_format = await self.get_cdn_url(clean_id, quality)
+        q_norm = quality.lower().strip()
+        cdn_url, audio_format = await self.get_cdn_url(clean_id, q_norm)
         if not cdn_url:
             return None
 
         # Reject non-FLAC when caller expects lossless; BitChord will fall back to YouTube otherwise
         is_flac = audio_format == "flac"
-        if not is_flac and quality == "lossless":
+        if not is_flac and q_norm == "lossless":
             logger.info(f"Deezer track {clean_id} has no FLAC; returning None to trigger provider fallback")
             return None
 
+        url_suffix = f"?quality={q_norm}" if q_norm in ("high", "low") else ""
+        calc_bitrate = 1411 if is_flac else (128 if "128" in audio_format else 320)
+        audio_quality_label = "LOSSLESS" if is_flac else ("LOW" if "128" in audio_format else "HIGH")
+
         return {
-            "url": f"{self.public_host}/audio/dz/{clean_id}",
+            "url": f"{self.public_host}/audio/dz/{clean_id}{url_suffix}",
             "format": "flac" if is_flac else "mp3",
             "codec": "flac" if is_flac else "mp3",
             "container": "flac" if is_flac else "mp3",
             "bitDepth": 16,
             "sampleRate": 44100,
-            "bitrate": 1411 if is_flac else 320,
+            "bitrate": calc_bitrate,
+            "audioQuality": audio_quality_label,
         }
 
     async def stream_decrypted_audio(
         self,
         track_id: str,
-        range_header: str | None = None
+        range_header: str | None = None,
+        quality: str = "lossless"
     ) -> tuple[AsyncGenerator[bytes, None], dict[str, str], int]:
         """Fetch encrypted CDN stream, decrypt Blowfish chunks, and yield clean audio with byte-accurate Range support.
 
@@ -374,7 +406,7 @@ class DeezerProvider(MusicProvider):
         before the first audio byte and prevents the "stuck at upgrading quality" stall
         that occurs when HEAD returns no Content-Length and end_chunk is miscalculated.
         """
-        cdn_url, audio_format = await self.get_cdn_url(track_id)
+        cdn_url, audio_format = await self.get_cdn_url(track_id, quality=quality)
         if not cdn_url:
             raise RuntimeError(f"Unable to retrieve stream CDN URL for track {track_id}")
 

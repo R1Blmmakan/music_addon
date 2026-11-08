@@ -3,6 +3,7 @@ from typing import Any
 
 class ManifestOption(BaseModel):
     value: str
+    label: str | None = None
 
 class ManifestSetting(BaseModel):
     key: str
@@ -10,12 +11,16 @@ class ManifestSetting(BaseModel):
     options: list[ManifestOption]
 
 class ManifestResponse(BaseModel):
-    """Dual manifest schema satisfying both BitChord and Eclipse Music specifications."""
+    """Dual manifest schema satisfying both BitChord (v1.9.1) and Eclipse Music specifications."""
     id: str = "unified-lossless-homelab"
     name: str = "Homelab HiFi"
-    version: str = "2.2.0"
-    description: str = "Dual BitChord & Eclipse Music Lossless Addon"
+    version: str = "2.3.0"
+    description: str = "Dual BitChord v1.9.1 & Eclipse Music Addon"
     resources: list[str] = ["search", "stream", "isrc", "resolve"]
+    # BitChord v1.9.1 native extensions
+    allowDownloads: bool = True
+    checkValidLossless: bool = True
+    bitchordAuth: bool = False
     # Eclipse Music required extensions
     types: list[str] = ["track", "album", "artist"]
     contentType: str = "music"
@@ -34,6 +39,7 @@ class TrackItem(BaseModel):
     format: str = "flac"
     audioQuality: str = "LOSSLESS"
     bitrate: int = 1411
+    explicit: bool = False
     # Eclipse Music enrichment field (Apple Music / MusicKit linking)
     isrc: str | None = None
     streamURL: str | None = None
@@ -74,6 +80,7 @@ class StreamResponse(BaseModel):
     bitDepth: int = 16
     sampleRate: int = 44100
     bitrate: int = 1411
+    audioQuality: str = "LOSSLESS"
     encrypted: bool = False
 
     model_config = {"extra": "allow"}

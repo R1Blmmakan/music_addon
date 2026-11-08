@@ -148,6 +148,24 @@ def score_tidal_candidate(item: dict, clean_query: str) -> float | None:
     is_hi_res = "HI_RES_LOSSLESS" in tags or item.get("audioQuality") == "HI_RES_LOSSLESS"
     if is_hi_res:
         score -= 150.0
+
+    # Explicit vs Clean version weighting:
+    is_explicit = bool(item.get("explicit", False))
+    clean_in_query = bool(re.search(r'\bclean\b', query_lower))
+    is_clean_version = any(k in full_title for k in ("clean", "radio edit", "clean version"))
+    if not clean_in_query:
+        # Default: user prefers the unedited explicit original track
+        if is_explicit:
+            score -= 50.0
+        if is_clean_version:
+            score += 200.0  # Penalize censored/radio edits
+    else:
+        # Explicit query for clean version
+        if is_clean_version:
+            score -= 200.0
+        if is_explicit:
+            score += 300.0
+
     if "soundtrack" in t_album or "compilation" in t_album or is_compilation:
         score += 350.0
 
@@ -388,6 +406,7 @@ class TidalProvider(MusicProvider):
                     if a_name and a_name not in artists_list:
                         artists_list.append(a_name)
                 display_artist = ", ".join(artists_list).strip()
+                is_explicit = bool(item.get("explicit", False))
 
                 tracks.append({
                     "id": f"td:{item['id']}",
@@ -403,6 +422,7 @@ class TidalProvider(MusicProvider):
                     "audioModes": ["DOLBY_ATMOS"] if is_atmos else ["STEREO"],
                     "atmos": is_atmos,
                     "isrc": item.get("isrc") or None,
+                    "explicit": is_explicit,
                 })
                 if len(tracks) >= limit:
                     break
@@ -415,9 +435,8 @@ class TidalProvider(MusicProvider):
         """Fetch raw playback info from Tidal across quality tiers with country fallback.
 
         Loop order: quality → endpoint → country.
-        Exhausts all countries for the primary endpoint (postpaywall) before trying the
-        secondary endpoint. This keeps the fast-path (primary endpoint, home country, first
-        quality) to a single request for most tracks.
+        If a lossless quality (HI_RES_LOSSLESS) returns a downgraded lossy tier (HIGH/LOW)
+        and LOSSLESS is also in qualities, we continue to try LOSSLESS before giving up.
         """
         countries = [self.country_code]
         for fallback_cc in ("ID", "GB", "US"):
@@ -425,6 +444,8 @@ class TidalProvider(MusicProvider):
                 countries.append(fallback_cc)
 
         refresh_attempted = False
+        lossy_candidate = None
+
         for q in qualities:
             for endpoint in ("playbackinfopostpaywall", "playbackinfo"):
                 for cc in countries:
@@ -460,33 +481,52 @@ class TidalProvider(MusicProvider):
                             resp = await self.client.get(url, headers=self._auth_headers(), params=params)
 
                         if resp.status_code == 200:
-                            return resp.json()
+                            data = resp.json()
+                            returned_q = (data.get("audioQuality") or "").upper()
+                            if q in ("HI_RES_LOSSLESS", "LOSSLESS"):
+                                if returned_q in ("HI_RES_LOSSLESS", "LOSSLESS"):
+                                    return data
+                                # If HI_RES_LOSSLESS downgraded to HIGH/LOW, keep it as candidate and try LOSSLESS
+                                if "LOSSLESS" in qualities and q != "LOSSLESS":
+                                    if not lossy_candidate:
+                                        lossy_candidate = data
+                                    break  # break endpoint/country loop to try next quality (LOSSLESS)
+                                if not lossy_candidate:
+                                    lossy_candidate = data
+                            else:
+                                return data
                     except Exception as e:
                         logger.debug(f"Exception fetching {url}: {e}")
-        return None
+
+        return lossy_candidate
 
     async def get_stream(self, track_id: str, quality: str = "lossless", public_host: str = "") -> dict | None:
-        """Resolve track ID into signed FLAC CDN URL or DASH manifest with strict studio master upgrade."""
+        """Resolve track ID into signed FLAC/AAC CDN URL or DASH manifest."""
         if not self.is_configured():
             return None
 
         clean_id = track_id.replace("td:", "")
         original_id = clean_id
+        q_norm = quality.lower().strip()
 
-        # Prioritize HI_RES_LOSSLESS (24-bit Studio Master / Tidal Max) first,
-        # gracefully falling back to LOSSLESS (16-bit CD Quality FLAC)
-        qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS"]
+        if q_norm == "high":
+            qualities_to_try = ["HIGH"]
+        elif q_norm == "low":
+            qualities_to_try = ["LOW"]
+        else:
+            q_norm = "lossless"
+            qualities_to_try = ["HI_RES_LOSSLESS", "LOSSLESS"]
+
         data = await self._fetch_playback_info(clean_id, qualities_to_try)
         if not data:
             logger.info(f"Tidal playbackinfo returned no stream for track {clean_id}")
             return None
 
-        # Tidal returned only HIGH (AAC): no FLAC available for this track.
-        # Return None immediately so the caller's parallel Deezer pre-fetch delivers
-        # without waiting. The old studio-master search loop ran 3-5s here and routinely
-        # starved the Deezer fallback inside the 7s hard timeout.
-        if data.get("audioQuality") == "HIGH":
-            logger.info(f"Tidal track {clean_id} has no FLAC (HIGH only) — delegating to Deezer")
+        ret_audio_q = (data.get("audioQuality") or "").upper()
+
+        # If caller requested lossless, reject if Tidal only returned lossy (HIGH/LOW)
+        if q_norm == "lossless" and ret_audio_q not in ("HI_RES_LOSSLESS", "LOSSLESS"):
+            logger.info(f"Tidal track {clean_id} has no FLAC ({ret_audio_q} only) — delegating to Deezer")
             return None
 
         try:
@@ -521,22 +561,42 @@ class TidalProvider(MusicProvider):
                                 or (not codecs_str and audio_q in ("LOSSLESS", "HI_RES_LOSSLESS"))
                             )
                         )
-                        if not is_actual_flac:
-                            logger.info(f"Tidal track {clean_id} is only available in lossy ({codecs_str}). Rejecting per FLAC-only rule.")
-                            return None
 
-                        is_mp4 = ".mp4" in url.lower() or "mp4" in mime_str
-                        return {
-                            "url": url,
-                            "format": "flac",
-                            "codec": "flac",
-                            "container": "mp4" if is_mp4 else "flac",
-                            "manifest": "none",
-                            "encrypted": False,
-                            "bitDepth": raw_depth or 16,
-                            "sampleRate": raw_rate or 44100,
-                            "bitrate": 1411,
-                        }
+                        if q_norm == "lossless":
+                            if not is_actual_flac:
+                                logger.info(f"Tidal track {clean_id} is only available in lossy ({codecs_str}). Rejecting per FLAC-only rule.")
+                                return None
+
+                            is_mp4 = ".mp4" in url.lower() or "mp4" in mime_str
+                            is_hi_res = (bit_depth > 16) or (audio_q == "HI_RES_LOSSLESS")
+                            return {
+                                "url": url,
+                                "format": "flac",
+                                "codec": "flac",
+                                "container": "mp4" if is_mp4 else "flac",
+                                "manifest": "none",
+                                "encrypted": False,
+                                "bitDepth": raw_depth or 16,
+                                "sampleRate": raw_rate or 44100,
+                                "bitrate": 9216 if is_hi_res else 1411,
+                                "audioQuality": "HI_RES_LOSSLESS" if is_hi_res else "LOSSLESS",
+                            }
+                        else:
+                            # High or Low lossy tier requested
+                            is_mp4 = ".mp4" in url.lower() or "mp4" in mime_str
+                            target_bitrate = 320 if q_norm == "high" else 128
+                            return {
+                                "url": url,
+                                "format": "flac" if is_actual_flac else "aac",
+                                "codec": "flac" if is_actual_flac else "aac",
+                                "container": "mp4" if is_mp4 else ("flac" if is_actual_flac else "m4a"),
+                                "manifest": "none",
+                                "encrypted": False,
+                                "bitDepth": raw_depth or 16,
+                                "sampleRate": raw_rate or 44100,
+                                "bitrate": 1411 if is_actual_flac else target_bitrate,
+                                "audioQuality": "HIGH" if q_norm == "high" else "LOW",
+                            }
                 except Exception as decode_err:
                     logger.error(f"Failed to decode Tidal BTS manifest: {decode_err}")
 
@@ -564,25 +624,34 @@ class TidalProvider(MusicProvider):
                     logger.error(f"Failed to decode DASH XML: {e}")
                     return None
 
-                # Extract exact bandwidth from MPD Representation tag for accurate bitrate reporting
+                is_flac_dash = "flac" in decoded_xml.lower()
                 bw_match = re.search(r'bandwidth="(\d+)"', decoded_xml)
                 if bw_match:
-                    calc_bitrate = max(int(bw_match.group(1)) // 1000, 1411)
+                    calc_bitrate = max(int(bw_match.group(1)) // 1000, 128)
                 else:
-                    calc_bitrate = int((sample_rate or 44100) * (bit_depth or 16) * 2 // 1000)
+                    if q_norm == "lossless":
+                        calc_bitrate = int((sample_rate or 44100) * (bit_depth or 16) * 2 // 1000)
+                    else:
+                        calc_bitrate = 320 if q_norm == "high" else 128
 
-                effective_host = (public_host or self.public_host).rstrip("/")
                 manifest_url = f"{effective_host}/dash/td/{original_id}.mpd" if effective_host else f"/dash/td/{original_id}.mpd"
+                is_hi_res = (bit_depth > 16) or (ret_audio_q == "HI_RES_LOSSLESS")
+                resolved_aq = (
+                    "HI_RES_LOSSLESS" if (q_norm == "lossless" and is_hi_res)
+                    else ("LOSSLESS" if q_norm == "lossless" else ("HIGH" if q_norm == "high" else "LOW"))
+                )
+
                 return {
                     "url": manifest_url,
-                    "format": "flac",
-                    "codec": "flac",
+                    "format": "flac" if is_flac_dash else "aac",
+                    "codec": "flac" if is_flac_dash else "aac",
                     "container": "fmp4",
                     "manifest": "dash",
                     "encrypted": False,
                     "bitDepth": bit_depth,
                     "sampleRate": sample_rate,
                     "bitrate": calc_bitrate,
+                    "audioQuality": resolved_aq,
                 }
 
             return None

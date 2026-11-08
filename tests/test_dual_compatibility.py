@@ -289,4 +289,145 @@ class TestDualCompatibility(unittest.TestCase):
         req_explicit_prog = make_request(query_string="prefer=progressive", headers={"User-Agent": "AndroidXMedia3/1.11.0"})
         self.assertTrue(_needs_progressive_stream(req_explicit_prog))
 
+    def test_manifest_v191_flags_and_quality_settings(self):
+        """Verify BitChord v1.9.1 flags and 3-tier quality options in manifest."""
+        resp = self.client.get("/manifest.json")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+
+        # BitChord v1.9.1 schema flags
+        self.assertTrue(data.get("allowDownloads"))
+        self.assertTrue(data.get("checkValidLossless"))
+        self.assertFalse(data.get("bitchordAuth"))
+        self.assertEqual(data.get("version"), "2.3.0")
+
+        # Quality settings options: lossless, high, low
+        quality_setting = next((s for s in data.get("settings", []) if s.get("key") == "quality"), None)
+        self.assertIsNotNone(quality_setting)
+        self.assertEqual(quality_setting.get("default"), "lossless")
+        values = [opt["value"] for opt in quality_setting.get("options", [])]
+        self.assertIn("lossless", values)
+        self.assertIn("high", values)
+        self.assertIn("low", values)
+
+    def test_explicit_song_ranking_and_deduplication(self):
+        """Explicit versions must rank higher than clean radio edits, and replace them during deduplication."""
+        from app.main import score_track_relevance, merge_and_rank_tracks
+
+        clean_track = {
+            "id": "dz:111",
+            "title": "São Paulo (Radio Edit)",
+            "artist": "The Weeknd & Anitta",
+            "explicit": False,
+            "format": "flac"
+        }
+        explicit_track = {
+            "id": "dz:222",
+            "title": "São Paulo",
+            "artist": "The Weeknd & Anitta",
+            "explicit": True,
+            "format": "flac"
+        }
+
+        # 1. Without 'clean' in query: explicit track must score higher
+        score_clean = score_track_relevance(clean_track, "Sao Paulo The Weeknd Anitta", is_preferred=True)
+        score_explicit = score_track_relevance(explicit_track, "Sao Paulo The Weeknd Anitta", is_preferred=True)
+        self.assertGreater(score_explicit, score_clean)
+
+        # 2. With 'clean' in query: clean track must score higher
+        score_clean_q = score_track_relevance(clean_track, "Sao Paulo Clean The Weeknd", is_preferred=True)
+        score_explicit_q = score_track_relevance(explicit_track, "Sao Paulo Clean The Weeknd", is_preferred=True)
+        self.assertGreater(score_clean_q, score_explicit_q)
+
+        # 3. Deduplication: when both clean and explicit tracks match the same title/artist, explicit track wins
+        merged = merge_and_rank_tracks(
+            tidal_tracks=[],
+            deezer_tracks=[clean_track, explicit_track],
+            query="Sao Paulo The Weeknd"
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "dz:222")
+        self.assertTrue(merged[0]["explicit"])
+
+    def test_quality_options_resolution(self):
+        """Endpoint /stream/{item_id}?quality=... must respect requested quality tier."""
+        from app.main import deezer, tidal
+        import asyncio
+
+        mock_high_stream = {
+            "url": "https://api.r1fikri.dev/audio/dz/12345?quality=high",
+            "format": "mp3",
+            "codec": "mp3",
+            "container": "mp3",
+            "bitDepth": 16,
+            "sampleRate": 44100,
+            "bitrate": 320,
+            "audioQuality": "HIGH",
+        }
+        mock_low_stream = {
+            "url": "https://api.r1fikri.dev/audio/dz/12345?quality=low",
+            "format": "mp3",
+            "codec": "mp3",
+            "container": "mp3",
+            "bitDepth": 16,
+            "sampleRate": 44100,
+            "bitrate": 128,
+            "audioQuality": "LOW",
+        }
+
+        with patch.object(deezer, "is_configured", return_value=True):
+            with patch.object(deezer, "get_stream", side_effect=lambda tid, q: mock_high_stream if q == "high" else mock_low_stream):
+                # Request High (320kbps)
+                resp_high = self.client.get("/stream/dz:12345?quality=high")
+                self.assertEqual(resp_high.status_code, 200)
+                data_high = resp_high.json()
+                self.assertEqual(data_high["audioQuality"], "HIGH")
+                self.assertEqual(data_high["bitrate"], 320)
+                self.assertIn("quality=high", data_high["url"])
+
+                # Request Low (128kbps)
+                resp_low = self.client.get("/stream/dz:12345?quality=low")
+                self.assertEqual(resp_low.status_code, 200)
+                data_low = resp_low.json()
+                self.assertEqual(data_low["audioQuality"], "LOW")
+                self.assertEqual(data_low["bitrate"], 128)
+                self.assertIn("quality=low", data_low["url"])
+
+    def test_tidal_cd_quality_lossless_handling(self):
+        """When Tidal returns HIGH for HI_RES_LOSSLESS, _fetch_playback_info must continue to LOSSLESS and succeed."""
+        from app.main import tidal
+        import asyncio
+
+        def mock_get(url, headers=None, params=None):
+            resp = MagicMock()
+            resp.status_code = 200
+            q = params.get("audioquality")
+            if q == "HI_RES_LOSSLESS":
+                # Simulated Tidal downgrade to AAC HIGH
+                resp.json.return_value = {
+                    "audioQuality": "HIGH",
+                    "manifestMimeType": "application/vnd.tidal.bts",
+                    "manifest": "e30=",
+                }
+            elif q == "LOSSLESS":
+                # Simulated Tidal CD Quality FLAC
+                resp.json.return_value = {
+                    "audioQuality": "LOSSLESS",
+                    "bitDepth": 16,
+                    "sampleRate": 44100,
+                    "manifestMimeType": "application/vnd.tidal.bts",
+                    "manifest": "e30=",
+                }
+            return resp
+
+        async def run_test():
+            with patch.object(tidal.client, "get", side_effect=mock_get):
+                data = await tidal._fetch_playback_info("197645628", ["HI_RES_LOSSLESS", "LOSSLESS"])
+                self.assertIsNotNone(data)
+                # Must have resolved the LOSSLESS tier instead of stopping at HIGH
+                self.assertEqual(data.get("audioQuality"), "LOSSLESS")
+
+        asyncio.run(run_test())
+
+
 
