@@ -429,5 +429,225 @@ class TestDualCompatibility(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_fetch_playback_info_fast_fail_on_lossy_only(self):
+        """When Tidal returns 200 OK with HIGH for both HI_RES_LOSSLESS and LOSSLESS, it must make only 2 HTTP calls, not 8."""
+        from app.main import tidal
+        import asyncio
+
+        call_count = 0
+
+        async def mock_get(url, headers=None, params=None):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "audioQuality": "HIGH",
+                "manifestMimeType": "application/vnd.tidal.bts",
+                "manifest": "e30=",
+            }
+            return resp
+
+        async def run_test():
+            with patch.object(tidal.client, "get", side_effect=mock_get):
+                data = await tidal._fetch_playback_info("96905760", ["HI_RES_LOSSLESS", "LOSSLESS"])
+                self.assertIsNotNone(data)
+                self.assertEqual(data.get("audioQuality"), "HIGH")
+                self.assertEqual(call_count, 2)
+
+        asyncio.run(run_test())
+
+    def test_is_valid_tidal_match_rejects_wrong_artist_and_solo_variant(self):
+        """Cross-provider fallback and studio master upgrade must reject wrong artists and unrequested Solo/Remix variants."""
+        from app.providers.tidal import is_valid_tidal_match, score_tidal_candidate
+
+        # 1. Exact canonical match with featuring credits -> True
+        self.assertTrue(
+            is_valid_tidal_match(
+                "Close To Me (with Diplo) (feat. Swae Lee)",
+                "Ellie Goulding, Diplo, Swae Lee",
+                "Close To Me",
+                "Ellie Goulding",
+                cand_duration=182,
+                target_duration=182,
+            )
+        )
+
+        # 2. Unrequested '(Solo)' variant -> False
+        self.assertFalse(
+            is_valid_tidal_match(
+                "Close To Me (Solo)",
+                "Ellie Goulding",
+                "Close To Me",
+                "Ellie Goulding",
+                cand_duration=182,
+                target_duration=182,
+            )
+        )
+
+        # 3. Wrong artist cover with identical title -> False
+        self.assertFalse(
+            is_valid_tidal_match(
+                "Close To Me",
+                "Random Cover Artist",
+                "Close To Me",
+                "Ellie Goulding",
+                cand_duration=182,
+                target_duration=182,
+            )
+        )
+
+        # 4. score_tidal_candidate must reject wrong-artist cover when query includes artist
+        wrong_artist_item = {
+            "id": 568446931,
+            "title": "Close To Me",
+            "artist": {"name": "Some Cover Band"},
+            "artists": [{"name": "Some Cover Band"}],
+            "album": {"title": "Close To Me"},
+            "audioQuality": "HI_RES_LOSSLESS",
+            "mediaMetadata": {"tags": ["HI_RES_LOSSLESS"]},
+        }
+        self.assertIsNone(score_tidal_candidate(wrong_artist_item, "Close To Me Ellie Goulding"))
+
+        # 5. score_tidal_candidate must rank canonical track above unrequested '(Solo)' variant
+        canonical_item = {
+            "id": 96905760,
+            "title": "Close To Me",
+            "artist": {"name": "Ellie Goulding"},
+            "artists": [{"name": "Ellie Goulding"}, {"name": "Diplo"}],
+            "album": {"title": "Brightest Blue"},
+            "audioQuality": "LOSSLESS",
+            "mediaMetadata": {"tags": ["LOSSLESS"]},
+        }
+        solo_item = {
+            "id": 457312484,
+            "title": "Close To Me",
+            "version": "Solo",
+            "artist": {"name": "Ellie Goulding"},
+            "artists": [{"name": "Ellie Goulding"}],
+            "album": {"title": "Close To Me (Solo)"},
+            "audioQuality": "HI_RES_LOSSLESS",
+            "mediaMetadata": {"tags": ["HI_RES_LOSSLESS"]},
+        }
+        s_canon = score_tidal_candidate(canonical_item, "Close To Me Ellie Goulding")
+        s_solo = score_tidal_candidate(solo_item, "Close To Me Ellie Goulding")
+        self.assertIsNotNone(s_canon)
+        self.assertIsNotNone(s_solo)
+        # In score_tidal_candidate, lower (more negative) score is better
+        self.assertLess(s_canon, s_solo)
+
+    def test_merge_and_rank_prefers_hires_and_deduplicates_collaborator_editions(self):
+        """When multiple editions of the same song exist across providers/albums, deduplication must keep the Hi-Res Lossless edition."""
+        from app.main import merge_and_rank_tracks
+
+        high_only_edition = {
+            "id": "td:96905760",
+            "title": "Close To Me",
+            "artist": "Ellie Goulding, Diplo, Swae Lee",
+            "album": "Close To Me",
+            "audioQuality": "HIGH",
+            "format": "aac",
+            "explicit": False,
+        }
+        hires_edition = {
+            "id": "td:111222333",
+            "title": "Close To Me (feat. Swae Lee)",
+            "artist": "Ellie Goulding, Diplo",
+            "album": "Brightest Blue",
+            "audioQuality": "HI_RES_LOSSLESS",
+            "format": "flac",
+            "explicit": False,
+        }
+        merged = merge_and_rank_tracks(
+            tidal_tracks=[high_only_edition, hires_edition],
+            deezer_tracks=[],
+            query="Close To Me Ellie Goulding",
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "td:111222333")
+        self.assertEqual(merged[0]["audioQuality"], "HI_RES_LOSSLESS")
+
+    def test_studio_master_upgrade_via_hires_album_for_collapsed_isrc(self):
+        """When Tidal search collapses ISRC 96905760 (16-bit single) and hides 568446925 (Hi-Res on album 568446924),
+        _find_validated_studio_master must reject 568446931 (Solo) and discover 568446925 via album 568446924."""
+        from app.main import tidal
+        import asyncio
+
+        tidal.track_meta_cache["96905760"] = {
+            "title": "Close To Me",
+            "artist": "Ellie Goulding, Diplo, Swae Lee",
+            "duration": 183,
+            "album_id": 96905759,
+        }
+
+        async def mock_search(query, limit=10):
+            return [
+                {
+                    "id": "td:96905760",
+                    "title": "Close To Me",
+                    "artist": "Ellie Goulding, Diplo, Swae Lee",
+                    "album": "Close To Me",
+                    "album_id": 96905759,
+                    "duration": 183,
+                    "audioQuality": "LOSSLESS",
+                },
+                {
+                    "id": "td:568446931",
+                    "title": "Close To Me (Solo)",
+                    "artist": "Ellie Goulding, Diplo",
+                    "album": "EG.0",
+                    "album_id": 568446924,
+                    "duration": 183,
+                    "audioQuality": "HI_RES_LOSSLESS",
+                },
+            ]
+
+        async def mock_get(url, headers=None, params=None):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "/albums/568446924/tracks" in url:
+                resp.json.return_value = {
+                    "items": [
+                        {
+                            "id": 568446925,
+                            "title": "Close To Me",
+                            "version": None,
+                            "duration": 183,
+                            "explicit": True,
+                            "artist": {"name": "Ellie Goulding"},
+                            "artists": [
+                                {"name": "Ellie Goulding"},
+                                {"name": "Diplo"},
+                                {"name": "Swae Lee"},
+                            ],
+                            "mediaMetadata": {"tags": ["LOSSLESS", "HIRES_LOSSLESS"]},
+                        }
+                    ]
+                }
+            return resp
+
+        async def mock_fetch_playback(cid, qualities):
+            if cid == "568446925":
+                return {
+                    "audioQuality": "HI_RES_LOSSLESS",
+                    "manifestMimeType": "application/dash+xml",
+                    "manifest": "e30=",
+                }
+            return {"audioQuality": "HIGH"}
+
+        async def run_test():
+            with patch.object(tidal, "search", side_effect=mock_search), \
+                 patch.object(tidal.client, "get", side_effect=mock_get), \
+                 patch.object(tidal, "_fetch_playback_info", side_effect=mock_fetch_playback):
+                res = await tidal._find_validated_studio_master("96905760")
+                self.assertIsNotNone(res)
+                upgraded_id, data = res
+                self.assertEqual(upgraded_id, "568446925")
+                self.assertEqual(data.get("audioQuality"), "HI_RES_LOSSLESS")
+
+        asyncio.run(run_test())
+
+
+
 
 

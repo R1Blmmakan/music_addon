@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from fastapi import HTTPException
 import logging
 import time
@@ -16,6 +17,12 @@ logger = logging.getLogger("bitchord.deezer")
 # Deezer's checkForm CSRF token expires in ~1-2h; refresh every hour to prevent silent 401s.
 _SESSION_TTL_SECONDS = 3600
 
+
+def _strip_accents(text: str) -> str:
+    """Normalize unicode characters to ASCII base form (e.g. 'São Paulo' -> 'Sao Paulo')."""
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
 class DeezerProvider(MusicProvider):
     def __init__(self, arl: str, public_host: str):
         self.arl = arl
@@ -32,6 +39,9 @@ class DeezerProvider(MusicProvider):
         self._license_token: str | None = None
         self._session_initialized_at: float = 0.0
         self._cdn_cache: dict[str, tuple[str, str, float]] = {}
+        self.can_stream_lossless: bool = True
+        self.can_stream_hq: bool = True
+        self._consecutive_flac_failures: int = 0
 
     @property
     def name(self) -> str:
@@ -62,7 +72,8 @@ class DeezerProvider(MusicProvider):
             results = data.get("results", {})
             self._api_token = results.get("checkForm")
             user = results.get("USER", {})
-            self._license_token = user.get("OPTIONS", {}).get("license_token")
+            options = user.get("OPTIONS", {})
+            self._license_token = options.get("license_token")
 
             user_id = user.get("USER_ID", 0)
             if user_id and user_id != 0:
@@ -72,8 +83,20 @@ class DeezerProvider(MusicProvider):
                         "Update DEEZER_ARL in your .env with a fresh cookie from browser."
                     )
                     return False
+                if "web_lossless" in options or "mobile_lossless" in options:
+                    self.can_stream_lossless = bool(options.get("web_lossless") or options.get("mobile_lossless"))
+                    self.can_stream_hq = bool(options.get("web_hq") or options.get("mobile_hq") or self.can_stream_lossless)
+                    if not self.can_stream_lossless:
+                        logger.warning(
+                            f"Deezer account {user_id} has no lossless entitlement (web_lossless=False). "
+                            "Lossless requests will bypass Deezer and use Tidal."
+                        )
+                self._consecutive_flac_failures = 0
                 self._session_initialized_at = time.monotonic()
-                logger.info(f"Deezer authenticated as user ID {user_id}")
+                logger.info(
+                    f"Deezer authenticated as user ID {user_id} "
+                    f"(lossless={self.can_stream_lossless}, hq={self.can_stream_hq})"
+                )
                 return True
 
             logger.critical(
@@ -115,8 +138,12 @@ class DeezerProvider(MusicProvider):
             if not items:
                 return []
 
-            q_lower = clean_query.lower()
-            version_keywords = ("remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft")
+            q_lower = _strip_accents(clean_query).lower()
+            version_keywords = (
+                "remix", "mix", "dub", "edit", "version", "solo", "acoustic",
+                "instrumental", "live", "extended", "vip", "rework", "sped",
+                "slowed", "feat", "ft",
+            )
             query_wants_version = any(re.search(r'\b' + re.escape(k) + r'\b', q_lower) for k in version_keywords)
             q_words = [w for w in re.sub(r'[^\w\s]', '', q_lower).split() if w not in ("with", "feat", "ft")]
             format_keywords = set(version_keywords)
@@ -125,36 +152,50 @@ class DeezerProvider(MusicProvider):
             junk_keywords = (
                 "karaoke", "tribute", "originally performed", "in the style of",
                 "backing track", "piano tribute", "lullaby", "8-bit", "emulation",
-                "made popular by", "party tyme", "instrumental"
+                "made popular by", "party tyme", "instrumental", "cover",
+                "speed up", "sped up", "slowed", "sound-alike", "soundalike",
+            )
+
+            variant_tokens = (
+                "remix", "mix", "dub", "edit", "re-mix", "solo", "acoustic",
+                "instrumental", "live", "extended", "vip", "rework", "sped", "slowed",
             )
 
             scored = []
             for idx, item in enumerate(items):
                 raw_title = item.get("title", "").strip()
-                title = raw_title.lower()
-                title_version = (item.get("title_version") or "").strip().lower()
-                core_title = re.sub(r'[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE).strip()
+                title = _strip_accents(raw_title).lower()
+                title_version = _strip_accents(item.get("title_version") or "").strip().lower()
+                core_title = re.sub(r'[\(\[](?:feat|ft|with|featuring)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE).strip()
                 full_title = f"{title} {title_version}".strip()
-                artist = item.get("artist", {}).get("name", "").strip().lower()
+                artist = _strip_accents(item.get("artist", {}).get("name", "")).strip().lower()
                 rank = int(item.get("rank", 0) or 0)
 
-                is_remix = any(k in full_title for k in ("remix", "mix", "dub", "edit", "re-mix"))
-                has_version = bool(title_version) or is_remix
+                title_word_set = set(re.sub(r'[^\w\s]', ' ', core_title).split())
+                artist_word_set = set(re.sub(r'[^\w\s]', ' ', artist).split())
 
-                # Zero-relevance check: candidate MUST match at least one non-format content word
+                is_variant = any(re.search(r'\b' + re.escape(k) + r'\b', full_title) for k in variant_tokens)
+                has_version = bool(title_version) or is_variant
+
+                # Strict relevance gate: must match content words, and if query includes both
+                # title and artist words, candidate must match both.
                 if artist_q_words:
-                    has_title_match = any(w in core_title.split() for w in artist_q_words)
-                    has_artist_match = any(w in artist.split() for w in artist_q_words)
-                    if not has_title_match and not has_artist_match:
+                    matched_t = sum(1 for w in artist_q_words if w in title_word_set)
+                    matched_a = sum(1 for w in artist_q_words if w in artist_word_set)
+                    if matched_t == 0 and matched_a == 0:
+                        continue
+                    unmatched_by_title = [w for w in artist_q_words if w not in title_word_set]
+                    unmatched_by_artist = [w for w in artist_q_words if w not in artist_word_set]
+                    if unmatched_by_title and matched_a == 0:
+                        continue
+                    if unmatched_by_artist and matched_t == 0:
                         continue
 
                 # Demote junk / karaoke
                 is_junk = any(k in full_title or k in artist for k in junk_keywords if k not in q_lower)
                 score = 1000 if is_junk else 0
 
-                # Version & Remix Gate:
-                # If query specifically asks for a version/mix/remix/live/acoustic, reward the matching version!
-                # If query does NOT ask for a version, demote remixes so the canonical studio track is preferred.
+                # Version & Variant Gate:
                 if query_wants_version:
                     matched_v_words = any(w in full_title for w in version_keywords if w in q_lower)
                     if matched_v_words:
@@ -162,9 +203,11 @@ class DeezerProvider(MusicProvider):
                     elif not has_version:
                         score += 300  # Demote plain track when user specifically asked for a version
                 else:
-                    if is_remix:
-                        score += 800  # Heavily demote remixes when user did not ask for remix
-                    elif not title_version:
+                    if is_variant:
+                        score += 800  # Heavily demote variants (e.g. Solo, Remix, Live) when user did not ask for one
+                    elif title_version and not any(k in title_version for k in ("explicit", "remaster", "album version", "single version", "original")):
+                        score += 400
+                    else:
                         score -= 200  # Bonus for canonical album track
 
                 # Title matching (using core_title without feat fluff)
@@ -173,21 +216,26 @@ class DeezerProvider(MusicProvider):
                 elif core_title in q_lower or q_lower.startswith(core_title):
                     score -= 600
                 else:
-                    matched_title = sum(1 for w in q_words if w in core_title.split() and w not in format_keywords)
+                    matched_title = sum(1 for w in q_words if w in title_word_set and w not in format_keywords)
                     score -= min(100 * matched_title, 350)
-                    extra_words = sum(1 for w in core_title.split() if w not in q_words and w not in format_keywords)
+                    extra_words = sum(1 for w in title_word_set if w not in q_words and w not in format_keywords)
                     score += 100 * extra_words
 
                 # Artist matching (ignoring format keywords)
-                matched_artist = sum(1 for w in artist_q_words if w in artist.split())
+                matched_artist = sum(1 for w in artist_q_words if w in artist_word_set)
                 score -= 100 * matched_artist
-                if artist in q_lower or any(a in q_lower for a in artist.split()):
+                if artist in q_lower or any(a in q_lower for a in artist_word_set):
                     score -= 150
+
+                # Penalize query words missing from both title and artist
+                unmatched_anywhere = sum(1 for w in artist_q_words if w not in title_word_set and w not in artist_word_set)
+                if unmatched_anywhere > 0:
+                    score += 250 * unmatched_anywhere
 
                 # Synergy bonus
                 if len(q_words) >= 2 and artist_q_words:
-                    has_title_match = any(w in core_title.split() for w in q_words if w not in format_keywords)
-                    has_artist_match = any(w in artist.split() for w in artist_q_words)
+                    has_title_match = any(w in title_word_set for w in q_words if w not in format_keywords)
+                    has_artist_match = any(w in artist_word_set for w in artist_q_words)
                     if has_title_match and has_artist_match:
                         score -= 300
 
@@ -235,9 +283,9 @@ class DeezerProvider(MusicProvider):
                     "album": item.get("album", {}).get("title", ""),
                     "duration": int(round(float(item.get("duration", 0) or 0))),
                     "artworkURL": artwork,
-                    "format": "flac",
-                    "audioQuality": "LOSSLESS",
-                    "bitrate": 1411,
+                    "format": "flac" if self.can_stream_lossless else "mp3",
+                    "audioQuality": "LOSSLESS" if self.can_stream_lossless else ("HIGH" if self.can_stream_hq else "LOW"),
+                    "bitrate": 1411 if self.can_stream_lossless else (320 if self.can_stream_hq else 128),
                     "isrc": item.get("isrc") or None,
                     "explicit": is_explicit,
                 })
@@ -368,14 +416,26 @@ class DeezerProvider(MusicProvider):
         """Return BitChord stream response pointing to internal decrypt proxy."""
         clean_id = track_id.replace("dz:", "")
         q_norm = quality.lower().strip()
+        if q_norm == "lossless" and not self.can_stream_lossless:
+            return None
+
         cdn_url, audio_format = await self.get_cdn_url(clean_id, q_norm)
         if not cdn_url:
             return None
 
         # Reject non-FLAC when caller expects lossless; BitChord will fall back to YouTube otherwise
         is_flac = audio_format == "flac"
-        if not is_flac and q_norm == "lossless":
-            logger.info(f"Deezer track {clean_id} has no FLAC; returning None to trigger provider fallback")
+        if is_flac:
+            self._consecutive_flac_failures = 0
+        elif q_norm == "lossless":
+            self._consecutive_flac_failures += 1
+            if self._consecutive_flac_failures >= 3 and self.can_stream_lossless:
+                self.can_stream_lossless = False
+                logger.warning(
+                    f"Deezer returned non-FLAC ({audio_format}) 3 times in a row — "
+                    "marking Deezer ARL as lossy-only (HiFi subscription expired or Free account)."
+                )
+            logger.info(f"Deezer track {clean_id} has no FLAC ({audio_format}); returning None to trigger provider fallback")
             return None
 
         url_suffix = f"?quality={q_norm}" if q_norm in ("high", "low") else ""

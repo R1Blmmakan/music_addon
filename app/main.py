@@ -312,29 +312,45 @@ def sanitize_search_query(query: str) -> str:
 
 def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
     """Score track relevance to query for multi-provider interleaving and deduplication."""
-    q_lower = query.lower().strip()
+    from app.providers.tidal import _strip_accents
+
+    q_lower = _strip_accents(query).lower().strip()
     q_clean = re.sub(r'[^\w\s]', ' ', q_lower)
     q_words = [w for w in q_clean.split() if w]
     if not q_words:
         return 0.0
 
-    version_keywords = {"remix", "mix", "dub", "edit", "version", "acoustic", "instrumental", "live", "feat", "ft"}
+    version_keywords = {
+        "remix", "mix", "dub", "edit", "version", "solo", "acoustic",
+        "instrumental", "live", "extended", "vip", "rework", "sped",
+        "slowed", "feat", "ft",
+    }
     content_words = [w for w in q_words if w not in version_keywords]
     format_query_words = [w for w in q_words if w in version_keywords]
 
-    title = track.get("title", "").strip().lower()
-    artist = track.get("artist", "").strip().lower()
+    title = _strip_accents(track.get("title", "")).strip().lower()
+    artist = _strip_accents(track.get("artist", "")).strip().lower()
     core_title = re.sub(r'[\(\[][^\)\]]*[\)\]]', '', title).strip()
 
     title_words = set(re.sub(r'[^\w\s]', ' ', title).split())
+    core_title_words = set(re.sub(r'[^\w\s]', ' ', core_title).split())
     artist_words = set(re.sub(r'[^\w\s]', ' ', artist).split())
 
     matched_title_content = sum(1 for w in content_words if w in title_words)
     matched_artist_content = sum(1 for w in content_words if w in artist_words)
 
     # Zero-relevance check: must match at least one content word if content_words exist
-    if content_words and matched_title_content == 0 and matched_artist_content == 0:
-        return -1.0
+    if content_words:
+        if matched_title_content == 0 and matched_artist_content == 0:
+            return -1.0
+        unmatched_by_title = [w for w in content_words if w not in core_title_words and w not in title_words]
+        unmatched_by_artist = [w for w in content_words if w not in artist_words]
+        # Reject wrong-artist covers when query contains artist words beyond the title
+        if unmatched_by_title and matched_artist_content == 0:
+            return -1.0
+        # Reject unrelated songs by the same artist when query contains title words beyond the artist
+        if unmatched_by_artist and matched_title_content == 0:
+            return -1.0
 
     score = (matched_title_content * 40.0) + (matched_artist_content * 40.0)
 
@@ -351,8 +367,12 @@ def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
     if matched_title_content > 0 and matched_artist_content > 0:
         score += 80.0
 
-    # Specific version & mix alignment:
-    has_mix = any(k in title for k in ("remix", "mix", "dub", "edit", "version"))
+    # Specific version & variant alignment (including 'solo', 'live', 'acoustic', 'remix'):
+    variant_tokens = (
+        "remix", "mix", "dub", "edit", "version", "solo", "acoustic",
+        "instrumental", "live", "extended", "vip", "rework", "sped", "slowed",
+    )
+    has_mix = any(re.search(r'\b' + re.escape(k) + r'\b', title) for k in variant_tokens)
     wants_version = bool(format_query_words) or any(
         w in ("tak", "tik", "alarm", "solo", "club", "reverk", "acoustic", "live") for w in q_words
     )
@@ -364,7 +384,16 @@ def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
             score -= 40.0
     else:
         if has_mix:
-            score -= 100.0
+            score -= 120.0
+
+    # Audio quality tier preference: prioritize HI_RES_LOSSLESS and LOSSLESS over lossy HIGH/LOW
+    aq = (track.get("audioQuality") or "").upper()
+    if aq == "HI_RES_LOSSLESS":
+        score += 25.0
+    elif aq == "LOSSLESS":
+        score += 10.0
+    elif aq in ("HIGH", "LOW"):
+        score -= 50.0
 
     if is_preferred:
         score += 5.0
@@ -387,6 +416,18 @@ def score_track_relevance(track: dict, query: str, is_preferred: bool) -> float:
 
     return score
 
+
+def _quality_rank(track: dict) -> int:
+    aq = (track.get("audioQuality") or "").upper()
+    if aq == "HI_RES_LOSSLESS":
+        return 3
+    if aq == "LOSSLESS" or track.get("format") == "flac":
+        return 2
+    if aq == "HIGH":
+        return 1
+    return 0
+
+
 def merge_and_rank_tracks(
     tidal_tracks: list[dict],
     deezer_tracks: list[dict],
@@ -394,6 +435,8 @@ def merge_and_rank_tracks(
     preferred_provider: str = "tidal"
 ) -> list[dict]:
     """Interleave and rank tracks from multiple providers based on relevance to query."""
+    from app.providers.tidal import _strip_accents
+
     scored_candidates = []
     for t in tidal_tracks:
         s = score_track_relevance(t, query, is_preferred=(preferred_provider == "tidal"))
@@ -407,29 +450,43 @@ def merge_and_rank_tracks(
 
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
-    clean_in_query = "clean" in query.lower().split()
+    clean_in_query = "clean" in _strip_accents(query).lower().split()
     seen_tracks: dict[tuple[str, str], tuple[float, dict]] = {}
 
     for s, prov, t in scored_candidates:
-        # Strip version annotations (clean, explicit, radio edit) to detect canonical track duplication
-        raw_t = t.get("title", "").lower()
-        core_t = re.sub(r'[\(\[][^\)\]]*(?:clean|explicit|radio edit|single version|album version)[^\)\]]*[\)\]]', '', raw_t)
-        core_t = re.sub(r'-\s*(?:clean|explicit|radio edit|single version|album version).*$', '', core_t)
+        # Strip collaborator credits & version annotations (clean, explicit, radio edit) to detect canonical duplication
+        raw_t = _strip_accents(t.get("title", "")).lower()
+        core_t = re.sub(r'[\(\[]\s*(?:feat|ft|with|featuring)\b[^\)\]]*[\)\]]', '', raw_t, flags=re.IGNORECASE)
+        core_t = re.sub(r'[\(\[][^\)\]]*(?:clean|explicit|radio edit|single version|album version|remaster)[^\)\]]*[\)\]]', '', core_t)
+        core_t = re.sub(r'-\s*(?:clean|explicit|radio edit|single version|album version|remaster).*$', '', core_t)
         norm_title = re.sub(r'[^a-z0-9]', '', core_t.strip())
-        norm_artist = re.sub(r'[^a-z0-9]', '', t.get("artist", "").lower())
+
+        raw_artist = _strip_accents(t.get("artist", "")).lower()
+        primary_artist = re.split(r'[,&;/]|\b(?:feat|ft|with|featuring)\b\.?', raw_artist, flags=re.IGNORECASE)[0]
+        norm_artist = re.sub(r'[^a-z0-9]', '', primary_artist) or re.sub(r'[^a-z0-9]', '', raw_artist)
         key = (norm_title, norm_artist)
 
         if key not in seen_tracks:
             seen_tracks[key] = (s, t)
         else:
             prev_s, prev_t = seen_tracks[key]
-            # When query does not specify 'clean', prioritize the explicit version
-            if not clean_in_query:
-                if t.get("explicit") and not prev_t.get("explicit"):
+            curr_q = _quality_rank(t)
+            prev_q = _quality_rank(prev_t)
+            # 1. Prefer lossless / Hi-Res edition over lossy edition
+            if curr_q > prev_q and (curr_q >= 2 or prev_q < 2):
+                if clean_in_query and t.get("explicit") and not prev_t.get("explicit"):
+                    pass
+                else:
                     seen_tracks[key] = (s, t)
-            else:
-                if not t.get("explicit") and prev_t.get("explicit"):
-                    seen_tracks[key] = (s, t)
+                    continue
+            # 2. Within compatible quality tiers, prioritize explicit vs clean according to query
+            if curr_q >= prev_q:
+                if not clean_in_query:
+                    if t.get("explicit") and not prev_t.get("explicit"):
+                        seen_tracks[key] = (s, t)
+                else:
+                    if not t.get("explicit") and prev_t.get("explicit"):
+                        seen_tracks[key] = (s, t)
 
     return [t for _, t in seen_tracks.values()]
 
@@ -440,8 +497,15 @@ async def search(q: str, quality: str = "lossless"):
     if not query:
         return {"tracks": [], "results": []}
 
+    q_tier = quality.lower().strip()
     tidal_limit = 15 if settings.preferred_provider == "tidal" else 8
     deezer_limit = 15 if settings.preferred_provider == "deezer" else 8
+
+    # If caller requests lossless and Deezer is known to lack lossless entitlement (e.g. Free ARL),
+    # do not pollute search results with unplayable dz: tracks when Tidal is available.
+    use_deezer = deezer.is_configured() and (
+        q_tier != "lossless" or deezer.can_stream_lossless or not tidal.is_configured()
+    )
 
     tasks = []
     if tidal.is_configured():
@@ -449,7 +513,7 @@ async def search(q: str, quality: str = "lossless"):
     else:
         tasks.append(asyncio.sleep(0, result=[]))
 
-    if deezer.is_configured():
+    if use_deezer:
         tasks.append(deezer.search(query, limit=deezer_limit))
     else:
         tasks.append(asyncio.sleep(0, result=[]))
@@ -679,14 +743,18 @@ async def _resolve_stream_inner(
         needs_progressive = needs_progressive or is_apple_client
 
     if item_id.startswith("td:"):
-        # Pre-launch Deezer fallback concurrently with tidal.get_stream().
-        # Tidal now returns None fast for HIGH-only tracks, so Deezer result
-        # is typically ready the moment Tidal fails — zero extra latency.
+        # Pre-launch Deezer fallback concurrently with tidal.get_stream() only if Deezer
+        # is capable of fulfilling the requested quality tier.
         tidal_task = asyncio.create_task(
             tidal.get_stream(item_id, quality, public_host=dynamic_host)
         )
         deezer_prefetch = None
-        if settings.enable_fallback and deezer.is_configured():
+        can_use_dz_fallback = (
+            settings.enable_fallback
+            and deezer.is_configured()
+            and (quality.lower() != "lossless" or getattr(deezer, "can_stream_lossless", True))
+        )
+        if can_use_dz_fallback:
             deezer_prefetch = asyncio.create_task(
                 _tidal_to_deezer_fallback(item_id, quality, hint_title, hint_artist)
             )
@@ -713,7 +781,6 @@ async def _resolve_stream_inner(
                 return fallback_stream
 
     if item_id.startswith("dz:"):
-        # Deezer is the primary provider with near-100% FLAC availability.
         # Resolve Deezer first; only invoke Tidal fallback if Deezer explicitly fails.
         res = await deezer.get_stream(item_id, quality)
         if res and res.get("url"):
@@ -751,14 +818,14 @@ def _clean_title_for_search(title: str, preserve_version: bool = False, preserve
         return re.sub(r'\s+', ' ', cleaned).strip()
 
     # Base canonical title cleaning: remove collaborator credits (feat/ft/with)
-    cleaned = re.sub(r'\s*[\(\[](?:feat|ft|with)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*[\(\[](?:feat|ft|with|featuring)\.?[^\)\]]*[\)\]]', '', title, flags=re.IGNORECASE)
     # Strip all version, mix, edit, and edition suffixes
     cleaned = re.sub(
-        r'\s*[\(\[][^\)\]]*(?:remix|mix|dub|edit|version|live|acoustic|instrumental|clean|explicit|deluxe|bonus|remaster)[^\)\]]*[\)\]]',
+        r'\s*[\(\[][^\)\]]*(?:remix|mix|dub|edit|version|solo|live|acoustic|instrumental|clean|explicit|deluxe|bonus|remaster)[^\)\]]*[\)\]]',
         '', cleaned, flags=re.IGNORECASE,
     )
     cleaned = re.sub(
-        r'\s*-\s*(?:radio edit|extended mix|single version|solo version|remix|mix|dub|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
+        r'\s*-\s*(?:radio edit|extended mix|single version|solo version|solo|remix|mix|dub|remaster(?:ed)?(?: \d+)?|live|acoustic|deluxe).*$',
         '', cleaned, flags=re.IGNORECASE,
     )
     return re.sub(r'\s+', ' ', cleaned).strip()
@@ -773,20 +840,31 @@ async def _tidal_to_deezer_fallback(
     """Search Deezer by track title+artist for a Tidal track that failed to resolve.
 
     Preserves mix, version, and featuring details so the exact version chosen by
-    the user is resolved on Deezer. Falls back to base canonical search only if
-    the version-specific match is unavailable.
+    the user is resolved on Deezer, and validates candidate title/artist/duration.
     """
+    from app.providers.tidal import API_BASE, is_valid_tidal_match
+
+    if quality.lower() == "lossless" and not getattr(deezer, "can_stream_lossless", True):
+        return None
+
     clean_id = item_id.replace("td:", "")
     target_title = ""
     artist = ""
+    target_duration = 0
 
-    # Short-circuit: if hints were provided by the caller, use them immediately
+    # Short-circuit: if hints were provided by the caller or cached from search, use them immediately
+    cached_meta = tidal.track_meta_cache.get(clean_id)
     if hint_title and hint_artist:
         target_title = hint_title
         artist = hint_artist
+        if cached_meta:
+            target_duration = cached_meta.get("duration", 0)
         logger.debug(f"Direct hint metadata for Deezer fallback: title={target_title!r}, artist={artist!r}")
+    elif cached_meta and cached_meta.get("title") and cached_meta.get("artist"):
+        target_title = cached_meta["title"]
+        artist = cached_meta["artist"]
+        target_duration = cached_meta.get("duration", 0)
     else:
-        from app.providers.tidal import API_BASE
         try:
             meta_resp = await tidal.client.get(
                 f"{API_BASE}/tracks/{clean_id}",
@@ -805,6 +883,7 @@ async def _tidal_to_deezer_fallback(
                     if a_name and a_name not in artists_list:
                         artists_list.append(a_name)
                 artist = ", ".join(artists_list).strip()
+                target_duration = int(round(float(meta.get("duration", 0) or 0)))
         except Exception as exc:
             logger.warning(f"Could not fetch Tidal metadata for {clean_id}: {exc}")
 
@@ -812,17 +891,16 @@ async def _tidal_to_deezer_fallback(
         logger.warning(f"No title/artist available for Deezer fallback on {clean_id}")
         return None
 
-    # Two-tier resolution:
-    # Tier 1: Targeted search preserving mix / version / featuring
-    # Tier 2: Canonical base title search (only if Tier 1 yields no stream)
+    primary_artist = re.split(r'[,&;/]|\b(?:feat|ft|with|featuring)\b\.?', artist, flags=re.IGNORECASE)[0].strip()
+
     queries_to_try = []
-    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
+    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|solo|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
     if has_version_hint:
         targeted_clean = _clean_title_for_search(target_title, preserve_version=True)
-        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {artist}"))
+        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {primary_artist}"))
 
     base_clean = _clean_title_for_search(target_title, preserve_version=False)
-    base_query = sanitize_search_query(f"{base_clean} {artist}")
+    base_query = sanitize_search_query(f"{base_clean} {primary_artist}")
     if base_query not in queries_to_try:
         queries_to_try.append(base_query)
 
@@ -830,6 +908,15 @@ async def _tidal_to_deezer_fallback(
         logger.debug(f"Attempting Deezer fallback with query: {q!r}")
         dz_matches = await deezer.search(q, limit=3)
         for match in dz_matches:
+            if not is_valid_tidal_match(
+                match.get("title", ""),
+                match.get("artist", ""),
+                target_title,
+                artist,
+                match.get("duration", 0),
+                target_duration,
+            ):
+                continue
             stream = await deezer.get_stream(match["id"], quality)
             if stream and stream.get("url"):
                 logger.info(f"Deezer fallback resolved {q!r} to {match['id']}")
@@ -838,8 +925,11 @@ async def _tidal_to_deezer_fallback(
     return None
 
 async def _deezer_to_tidal_fallback(item_id: str, quality: str, dynamic_host: str) -> dict | None:
-    """Fetch track title+artist from Deezer public API, then search Tidal for cross-provider fallback."""
+    """Fetch track title+artist from Deezer public API, then search Tidal for validated cross-provider fallback."""
+    from app.providers.tidal import is_valid_tidal_match
+
     clean_id = item_id.replace("dz:", "")
+    target_duration = 0
     try:
         meta_resp = await deezer.client.get(f"https://api.deezer.com/track/{clean_id}")
         if meta_resp.status_code != 200:
@@ -849,28 +939,42 @@ async def _deezer_to_tidal_fallback(item_id: str, quality: str, dynamic_host: st
         title_version = (meta.get("title_version") or "").strip()
         target_title = f"{title} ({title_version})" if title_version and title_version.lower() not in title.lower() else title
         artist = meta.get("artist", {}).get("name", "").strip()
+        target_duration = int(round(float(meta.get("duration", 0) or 0)))
         if not target_title or not artist:
             return None
     except Exception as exc:
         logger.warning(f"Could not fetch Deezer metadata for {clean_id}: {exc}")
         return None
 
+    primary_artist = re.split(r'[,&;/]|\b(?:feat|ft|with|featuring)\b\.?', artist, flags=re.IGNORECASE)[0].strip()
+
     queries_to_try = []
-    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
+    has_version_hint = bool(re.search(r'\b(?:remix|mix|dub|edit|version|solo|acoustic|instrumental|live|feat|ft)\b', target_title, re.IGNORECASE))
     if has_version_hint:
         targeted_clean = _clean_title_for_search(target_title, preserve_version=True)
-        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {artist}"))
+        queries_to_try.append(sanitize_search_query(f"{targeted_clean} {primary_artist}"))
 
     base_clean = _clean_title_for_search(target_title, preserve_version=False)
-    base_query = sanitize_search_query(f"{base_clean} {artist}")
+    base_query = sanitize_search_query(f"{base_clean} {primary_artist}")
     if base_query not in queries_to_try:
         queries_to_try.append(base_query)
 
     for q in queries_to_try:
         logger.debug(f"Attempting Tidal fallback with query: {q!r}")
-        td_matches = await tidal.search(q, limit=3)
+        td_matches = await tidal.search(q, limit=5)
         for match in td_matches:
-            stream = await tidal.get_stream(match["id"], quality, public_host=dynamic_host)
+            if quality.lower() == "lossless" and match.get("audioQuality") not in ("HI_RES_LOSSLESS", "LOSSLESS"):
+                continue
+            if not is_valid_tidal_match(
+                match.get("title", ""),
+                match.get("artist", ""),
+                target_title,
+                artist,
+                match.get("duration", 0),
+                target_duration,
+            ):
+                continue
+            stream = await tidal.get_stream(match["id"], quality, public_host=dynamic_host, _allow_upgrade=False)
             if stream and stream.get("url"):
                 logger.info(f"Tidal fallback resolved {q!r} to {match['id']}")
                 return stream

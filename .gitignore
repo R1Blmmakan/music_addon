@@ -2,6 +2,9 @@
 .env
 *.env
 token.json
+data/
+*.token.json
+.pkce_state.json
 
 # Python
 __pycache__/
