@@ -5,6 +5,7 @@ because Tidal encodes sampleRate=0 in the fLaC box header for Hi-Res tracks.
 """
 import asyncio
 import base64
+import html
 import json
 import logging
 import re
@@ -904,7 +905,7 @@ class TidalProvider(MusicProvider):
                     # which crashes ExoPlayer's FragmentedMp4Extractor before audio starts.
                     init_match = re.search(r'initialization="([^"]+)"', decoded_xml)
                     if init_match:
-                        orig_init_url = init_match.group(1)
+                        orig_init_url = html.unescape(init_match.group(1))
                         self.init_url_cache[clean_id] = orig_init_url
                         if original_id != clean_id:
                             self.init_url_cache[original_id] = orig_init_url

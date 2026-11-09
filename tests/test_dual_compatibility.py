@@ -647,6 +647,37 @@ class TestDualCompatibility(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_dash_init_unescapes_cloudfront_xml_entities(self):
+        """CloudFront DASH manifests contain &amp; in initialization URLs; init_url_cache and serve_dash_init must unescape to &."""
+        import base64
+        import asyncio
+        from app.main import tidal
+
+        cf_url_xml = "https://sp-ad-cf.audio.tidal.com/mediatracks/abc/0.mp4?Policy=eyJ&amp;Signature=twc&amp;Key-Pair-Id=K14"
+        expected_clean_url = "https://sp-ad-cf.audio.tidal.com/mediatracks/abc/0.mp4?Policy=eyJ&Signature=twc&Key-Pair-Id=K14"
+        mpd_xml = f'<MPD><Period><AdaptationSet><Representation codecs="flac" bandwidth="1411000"><SegmentTemplate initialization="{cf_url_xml}" media="https://sp-ad-cf.audio.tidal.com/mediatracks/abc/$Number$.mp4?Policy=eyJ&amp;Signature=twc&amp;Key-Pair-Id=K14"/></Representation></AdaptationSet></Period></MPD>'
+        encoded_mpd = base64.b64encode(mpd_xml.encode("utf-8")).decode("utf-8")
+
+        async def mock_fetch_playback(cid, qualities):
+            return {
+                "audioQuality": "HI_RES_LOSSLESS",
+                "manifestMimeType": "application/dash+xml",
+                "manifest": encoded_mpd,
+                "bitDepth": 16,
+                "sampleRate": 44100,
+            }
+
+        async def run_test():
+            with patch.object(tidal, "is_configured", return_value=True), \
+                 patch.object(tidal, "_fetch_playback_info", side_effect=mock_fetch_playback):
+                stream = await tidal.get_stream("td:77080091", "lossless", public_host="http://testserver")
+                self.assertIsNotNone(stream)
+                self.assertEqual(tidal.init_url_cache.get("77080091"), expected_clean_url)
+                self.assertNotIn("&amp;", tidal.init_url_cache.get("77080091"))
+
+        asyncio.run(run_test())
+
+
 
 
 

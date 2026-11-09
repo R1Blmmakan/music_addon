@@ -1,4 +1,5 @@
 import re
+import html
 import base64
 import asyncio
 import hashlib
@@ -1072,7 +1073,7 @@ async def serve_dash_init(track_id: str, request: Request):
             init_url = tidal.init_url_cache.get(clean_id)
         if init_url:
             try:
-                resp = await tidal.client.get(init_url)
+                resp = await tidal.client.get(html.unescape(init_url))
                 if resp.status_code == 200:
                     raw_bytes = bytearray(resp.content)
                     flac_pos = raw_bytes.find(b"fLaC")
